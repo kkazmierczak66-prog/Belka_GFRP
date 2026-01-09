@@ -886,7 +886,7 @@ if len(selected_idx):
             current_exec_df = ensure_exec_ids(st.session_state[EXEC_DF]).reset_index(drop=True)
 
             # --- testy per wykonanie ---
-            st.markdown("## Testy")
+
 
             for idx_exec, erow in current_exec_df.iterrows():
                 nr_wyk = erow.get("Nr wyk.", idx_exec + 1)
