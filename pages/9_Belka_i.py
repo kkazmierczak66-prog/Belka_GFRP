@@ -524,7 +524,7 @@ except Exception:
 
 st.header("Parametry belki")
 
-st.subheader("Parametry geometryczne (prostokąt)")
+
 
 col_g1, col_g2, col_g3 = st.columns(3)
 with col_g1:
