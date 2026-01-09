@@ -585,7 +585,7 @@ except Exception:
 
 st.header("Parametry belki")
 
-st.header("Parametry belki")
+
 
 # --- 1) Parametry geometryczne ---
 st.subheader("Parametry geometryczne")
