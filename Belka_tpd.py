@@ -5,17 +5,8 @@ import math
 
 from io import BytesIO
 from datetime import datetime
-
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
-from reportlab.lib.styles import getSampleStyleSheet
-
-from reportlab.lib.pagesizes import A4, landscape
-
 import matplotlib.pyplot as plt
-from reportlab.platypus import Image as RLImage
-from reportlab.lib.units import cm
+
 # ==========================
 # Google Sheets – receptury
 # ==========================
