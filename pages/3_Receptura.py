@@ -58,7 +58,7 @@ def to_num_series(s: pd.Series) -> pd.Series:
 
 
 # ---------------- Streamlit Page Setup ----------------
-st.set_page_config(page_title="Receptura (Google Sheets)", page_icon="", layout="wide")
+st.set_page_config(page_title="Receptura", page_icon="", layout="wide")
 st.title("Receptura mieszanki betonowej")
 
 # ---------------- Stałe i kolejność kategorii ----------------
@@ -373,6 +373,7 @@ else:
             key="btn_load_recipe_v2",
         )
 
+    sel_load = st.session_state.get("sel_recipe_to_load")
     if do_load and sel_load:
         df_r = df_recipes_all[df_recipes_all["recipe_name"].astype(str) == str(sel_load)].copy()
 
