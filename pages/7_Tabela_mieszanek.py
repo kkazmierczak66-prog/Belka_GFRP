@@ -1,7 +1,9 @@
 from __future__ import annotations
+
 import math
 from typing import List
 from zoneinfo import ZoneInfo
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -10,7 +12,6 @@ import streamlit as st
 # ---------- Konfiguracja strony ----------
 st.set_page_config(page_title="Tabela mieszanek", page_icon="", layout="wide")
 st.title("Tabela mieszanek")
-
 
 # ---------- Google Sheets / Secrets ----------
 GS_READY = False
@@ -50,14 +51,20 @@ HEADERS_RECIPES = [
 ]
 
 EXEC_HEADER = ["recipe_name", "timestamp", "Nr wyk.", "Data wyk.", "Wykonawca/y", "Uwagi"]
+
+# Nowy układ testów (zapis do Sheets):
 TEST_HEADER = [
     "recipe_name",
     "timestamp",
     "Nr wyk.",
     "Nr testu",
     "Data testu",
-    "Typ",
-    "Wynik",
+    "Wiek próbki [dni]",
+    "Rodzaj",
+    "Masa próbki [g]",
+    "Gęstość [kg/m3]",
+    "Siła niszcząca [kN]",
+    "Wynik [MPa]",
     "Wykonawca/y",
     "Opis zniszczenia / Uwagi",
 ]
@@ -84,6 +91,111 @@ def strip_apostrophe(s):
         return s
     s = str(s)
     return s[1:] if s.startswith("'") else s
+
+# ---------- Geometria próbek ----------
+RODZAJE = ["Kostka 10 cm", "Kostka 15 cm", "Cylinder 10 x 20 cm"]
+
+# objętość [m3], pole przekroju [mm2]
+SPECIMEN_GEOM = {
+    "Kostka 10 cm": {
+        "vol_m3": 0.1 * 0.1 * 0.1,                  # 0.001
+        "area_mm2": (0.1 * 0.1) * 1_000_000.0,      # 0.01 m2 -> 10000 mm2
+    },
+    "Kostka 15 cm": {
+        "vol_m3": 0.15 * 0.15 * 0.15,               # 0.003375
+        "area_mm2": (0.15 * 0.15) * 1_000_000.0,    # 0.0225 m2 -> 22500 mm2
+    },
+    "Cylinder 10 x 20 cm": {
+        "vol_m3": math.pi * (0.05 ** 2) * 0.20,     # pi*r^2*h
+        "area_mm2": (math.pi * (0.05 ** 2)) * 1_000_000.0,  # pi*r^2 m2 -> mm2
+    },
+}
+
+def compute_density_kgm3(mass_g, rodzaj: str):
+    m = to_num_pl(mass_g)
+    if pd.isna(m):
+        return pd.NA
+    if rodzaj not in SPECIMEN_GEOM:
+        return pd.NA
+    vol = SPECIMEN_GEOM[rodzaj]["vol_m3"]
+    if not vol or vol <= 0:
+        return pd.NA
+    mass_kg = float(m) / 1000.0
+    return mass_kg / vol
+
+def compute_strength_mpa(force_kn, rodzaj: str):
+    f = to_num_pl(force_kn)
+    if pd.isna(f):
+        return pd.NA
+    if rodzaj not in SPECIMEN_GEOM:
+        return pd.NA
+    area_mm2 = SPECIMEN_GEOM[rodzaj]["area_mm2"]
+    if not area_mm2 or area_mm2 <= 0:
+        return pd.NA
+    force_n = float(f) * 1000.0  # kN -> N
+    return force_n / area_mm2     # N/mm2 == MPa
+
+def normalize_tests_df(
+    df: pd.DataFrame,
+    base_exec_date: pd.Timestamp | None,
+) -> pd.DataFrame:
+    """
+    Uzupełnia brakujące kolumny, czyści typy oraz liczy:
+    - Wiek próbki [dni] = Data testu - Data wyk.
+    - Gęstość [kg/m3] z masy i rodzaju
+    - Wynik [MPa] z siły i rodzaju
+    """
+    cols = [
+        "Nr testu",
+        "Data testu",
+        "Wiek próbki [dni]",
+        "Rodzaj",
+        "Masa próbki [g]",
+        "Gęstość [kg/m3]",
+        "Siła niszcząca [kN]",
+        "Wynik [MPa]",
+        "Wykonawca/y",
+        "Opis zniszczenia / Uwagi",
+    ]
+    out = df.copy()
+    for c in cols:
+        if c not in out.columns:
+            out[c] = pd.NA
+
+    # Rodzaj: default gdy pusty
+    out["Rodzaj"] = out["Rodzaj"].astype("object")
+    out["Rodzaj"] = out["Rodzaj"].where(out["Rodzaj"].isin(RODZAJE), pd.NA)
+    out["Rodzaj"] = out["Rodzaj"].fillna(RODZAJE[0])
+
+    # Data testu: utrzymujemy jako tekst w edytorze, ale do obliczeń parsujemy
+    dt_test = pd.to_datetime(out["Data testu"], errors="coerce", dayfirst=True)
+
+    # Wiek próbki
+    if base_exec_date is not None and not pd.isna(base_exec_date):
+        age = (dt_test - base_exec_date).dt.days
+    else:
+        age = pd.Series([pd.NA] * len(out))
+    out["Wiek próbki [dni]"] = age
+
+    # Masa i siła na float do obliczeń
+    mass_g = out["Masa próbki [g]"].apply(to_num_pl)
+    force_kn = out["Siła niszcząca [kN]"].apply(to_num_pl)
+
+    dens_list = []
+    res_list = []
+    for i in range(len(out)):
+        rodz = out.loc[out.index[i], "Rodzaj"]
+        dens_list.append(compute_density_kgm3(mass_g.iloc[i], rodz))
+        res_list.append(compute_strength_mpa(force_kn.iloc[i], rodz))
+
+    out["Gęstość [kg/m3]"] = pd.Series(dens_list, index=out.index)
+    out["Wynik [MPa]"] = pd.Series(res_list, index=out.index)
+
+    # Teksty – unikamy NaN w UI
+    for c in ["Data testu", "Wykonawca/y", "Opis zniszczenia / Uwagi"]:
+        out[c] = out[c].astype("object").where(pd.notna(out[c]), "")
+
+    return out[cols]
 
 # ---------- Obsługa Sheets ----------
 def _open_ws(spreadsheet_id: str, sheet_name: str):
@@ -117,9 +229,7 @@ def read_materials(spreadsheet_id: str, sheet_name: str) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = None
 
-    # wyczyść ID gdyby były zapisane jako "'123"
     df["id"] = df["id"].apply(strip_apostrophe)
-    # liczby -> float
     for c in ["id", "gestosc_gcm3", "cena_pln", "co2e_kgkg"]:
         df[c] = df[c].apply(to_num_pl)
 
@@ -145,12 +255,10 @@ def read_recipes(spreadsheet_id: str, sheet_name: str, headers: List[str]) -> pd
     fixed[0] = headers
     df = pd.DataFrame(fixed[1:], columns=headers)
 
-    # material_id mógł być "'123"
     if "material_id" in df.columns:
         df["material_id"] = df["material_id"].apply(strip_apostrophe)
         df["material_id"] = pd.to_numeric(df["material_id"], errors="coerce")
 
-    # liczby zapisane jako tekst -> float
     num_cols = [
         "gestosc_kgm3", "udzial_pct", "obj_m3", "masa_kgm3",
         "sum_obj_m3m3", "sum_mas_kgm3", "gestosc_mix_kgm3", "w_c",
@@ -160,7 +268,6 @@ def read_recipes(spreadsheet_id: str, sheet_name: str, headers: List[str]) -> pd
         if c in df.columns:
             df[c] = df[c].apply(to_num_pl)
 
-    # timestamp -> datetime (obsługa tekstu i dni Excela)
     if "timestamp" in df.columns:
         def _to_dt_any(x):
             try:
@@ -188,15 +295,24 @@ def read_executions_sheet(spreadsheet_id: str, sheet_name: str) -> pd.DataFrame:
     return df[EXEC_HEADER]
 
 @st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False)
 def read_tests_sheet(spreadsheet_id: str, sheet_name: str) -> pd.DataFrame:
     ws = _open_or_create_ws(spreadsheet_id, sheet_name, TEST_HEADER)
     rows = ws.get_all_records(numericise_ignore=["all"])
     if not rows:
         return pd.DataFrame(columns=TEST_HEADER)
+
     df = pd.DataFrame(rows)
+
+    # --- NOWE: normalizacja nazw kolumn (różnice typu m³ vs m3, spacje itp.) ---
+    df.columns = [str(c).strip().replace("m³", "m3") for c in df.columns]
+
+    # --- NOWE: dołóż brakujące kolumny z TEST_HEADER ---
     for c in TEST_HEADER:
         if c not in df.columns:
             df[c] = None
+
+    # --- Zwracamy dokładnie w kolejności TEST_HEADER ---
     return df[TEST_HEADER]
 
 def ensure_exec_ids(df_exec: pd.DataFrame) -> pd.DataFrame:
@@ -208,21 +324,27 @@ def ensure_exec_ids(df_exec: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def ensure_test_ids(df_tests: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "Nr testu",
+        "Data testu",
+        "Wiek próbki [dni]",
+        "Rodzaj",
+        "Masa próbki [g]",
+        "Gęstość [kg/m3]",
+        "Siła niszcząca [kN]",
+        "Wynik [MPa]",
+        "Wykonawca/y",
+        "Opis zniszczenia / Uwagi",
+    ]
     if df_tests is None or df_tests.empty:
-        return pd.DataFrame(
-            columns=[
-                "Nr testu",
-                "Data testu",
-                "Typ",
-                "Wynik",
-                "Wykonawca/y",
-                "Opis zniszczenia / Uwagi",
-            ]
-        )
+        return pd.DataFrame(columns=cols)
     out = df_tests.copy().reset_index(drop=True)
+    for c in cols:
+        if c not in out.columns:
+            out[c] = pd.NA
     out["Nr testu"] = range(1, len(out) + 1)
     out["Nr testu"] = pd.to_numeric(out["Nr testu"], errors="coerce").astype("Int64")
-    return out
+    return out[cols]
 
 def stable_json_exec(df: pd.DataFrame) -> str:
     if df is None or len(df) == 0:
@@ -237,8 +359,11 @@ def stable_json_exec(df: pd.DataFrame) -> str:
 def stable_json_test(df: pd.DataFrame) -> str:
     if df is None or len(df) == 0:
         return "[]"
-    return df.sort_index().sort_index(axis=1).to_json(
-        orient="records", date_format="iso", date_unit="s"
+    return (
+        df.drop(columns=["_del"], errors="ignore")
+        .sort_index()
+        .sort_index(axis=1)
+        .to_json(orient="records", date_format="iso", date_unit="s")
     )
 
 def save_executions_and_tests_to_sheets():
@@ -266,12 +391,9 @@ def save_executions_and_tests_to_sheets():
 
     ws_exec = _open_or_create_ws(SPREADSHEET_ID, SHEET_EXECUTIONS, EXEC_HEADER)
     ws_exec.clear()
+    exec_values = [EXEC_HEADER]
     if exec_rows:
-        exec_values = [EXEC_HEADER] + [
-            [row.get(col, "") for col in EXEC_HEADER] for row in exec_rows
-        ]
-    else:
-        exec_values = [EXEC_HEADER]
+        exec_values += [[row.get(col, "") for col in EXEC_HEADER] for row in exec_rows]
     ws_exec.update("A1", exec_values)
 
     # --- testy ---
@@ -290,6 +412,9 @@ def save_executions_and_tests_to_sheets():
             nr_wyk_int = None
 
         df_tests = ensure_test_ids(value)
+
+        # zapisujemy również pola liczone (wiek, gęstość, wynik),
+        # bo o to prosisz ("ma się zapisywać do google sheets")
         for _, r in df_tests.iterrows():
             test_rows.append({
                 "recipe_name": rname,
@@ -297,20 +422,21 @@ def save_executions_and_tests_to_sheets():
                 "Nr wyk.": nr_wyk_int,
                 "Nr testu": r.get("Nr testu", ""),
                 "Data testu": r.get("Data testu", ""),
-                "Typ": r.get("Typ", ""),
-                "Wynik": r.get("Wynik", ""),
+                "Wiek próbki [dni]": r.get("Wiek próbki [dni]", ""),
+                "Rodzaj": r.get("Rodzaj", ""),
+                "Masa próbki [g]": r.get("Masa próbki [g]", ""),
+                "Gęstość [kg/m3]": r.get("Gęstość [kg/m3]", ""),
+                "Siła niszcząca [kN]": r.get("Siła niszcząca [kN]", ""),
+                "Wynik [MPa]": r.get("Wynik [MPa]", ""),
                 "Wykonawca/y": r.get("Wykonawca/y", ""),
                 "Opis zniszczenia / Uwagi": r.get("Opis zniszczenia / Uwagi", ""),
             })
 
     ws_test = _open_or_create_ws(SPREADSHEET_ID, SHEET_TESTS, TEST_HEADER)
     ws_test.clear()
+    test_values = [TEST_HEADER]
     if test_rows:
-        test_values = [TEST_HEADER] + [
-            [row.get(col, "") for col in TEST_HEADER] for row in test_rows
-        ]
-    else:
-        test_values = [TEST_HEADER]
+        test_values += [[row.get(col, "") for col in TEST_HEADER] for row in test_rows]
     ws_test.update("A1", test_values)
 
 def load_exec_state_from_sheet(rname: str, ts_raw: str, exec_ns: str):
@@ -325,11 +451,7 @@ def load_exec_state_from_sheet(rname: str, ts_raw: str, exec_ns: str):
     try:
         df_all = read_executions_sheet(SPREADSHEET_ID, SHEET_EXECUTIONS)
         if not df_all.empty:
-            mask = (
-                df_all["recipe_name"].astype(str) == str(rname)
-            ) & (
-                df_all["timestamp"].astype(str) == str(ts_raw)
-            )
+            mask = (df_all["recipe_name"].astype(str) == str(rname)) & (df_all["timestamp"].astype(str) == str(ts_raw))
             grp = df_all.loc[mask]
         else:
             grp = pd.DataFrame()
@@ -375,17 +497,40 @@ def load_tests_state_from_sheet(rname: str, ts_raw: str, nr_wyk_int: int, tests_
     except Exception:
         grp = pd.DataFrame()
 
+    wanted_local_cols = [
+        "Nr testu",
+        "Data testu",
+        "Wiek próbki [dni]",
+        "Rodzaj",
+        "Masa próbki [g]",
+        "Gęstość [kg/m3]",
+        "Siła niszcząca [kN]",
+        "Wynik [MPa]",
+        "Wykonawca/y",
+        "Opis zniszczenia / Uwagi",
+    ]
+
     if grp is not None and not grp.empty:
-        local = grp[
-            ["Nr testu", "Data testu", "Typ", "Wynik", "Wykonawca/y", "Opis zniszczenia / Uwagi"]
-        ].copy()
+        local = grp.copy()
+        # normalizacja nazw (strip + m³ -> m3), żeby uniknąć różnic w nagłówkach
+        local.columns = [str(c).strip().replace("m³", "m3") for c in local.columns]
+
+        for c in wanted_local_cols:
+            if c not in local.columns:
+                local[c] = pd.NA
+
+        local = local[wanted_local_cols].copy()
         local = ensure_test_ids(local)
     else:
         local = pd.DataFrame([{
             "Nr testu": 1,
             "Data testu": "",
-            "Typ": "",
-            "Wynik": "",
+            "Wiek próbki [dni]": pd.NA,
+            "Rodzaj": RODZAJE[0],
+            "Masa próbki [g]": pd.NA,
+            "Gęstość [kg/m3]": pd.NA,
+            "Siła niszcząca [kN]": pd.NA,
+            "Wynik [MPa]": pd.NA,
             "Wykonawca/y": "",
             "Opis zniszczenia / Uwagi": "",
         }])
@@ -422,7 +567,6 @@ with btn_load_col:
             st.cache_data.clear()
             st.session_state["df_mat"] = read_materials(SPREADSHEET_ID, SHEET_MATERIALS)
             st.session_state["df_rec"] = read_recipes(SPREADSHEET_ID, SHEET_RECIPES, HEADERS_RECIPES)
-            # Czyścimy lokalne wykonania/testy – przy kolejnym otwarciu expandera wczytają się z arkusza
             for key in list(st.session_state.keys()):
                 if isinstance(key, str) and (key.startswith("exec__") or key.startswith("tests__")):
                     del st.session_state[key]
@@ -472,14 +616,12 @@ mass_binder = _sum_mass(df_cmp_latest, ["spoiwo", "cement", "binder"])
 ws_series = (mass_water / mass_binder).replace([math.inf, -math.inf], pd.NA)
 
 # ---------- Koszt i CO₂ ----------
-# material_id mógł być tekstem z apostrofem – wyczyść jeszcze raz dla pewności:
 df_cmp_latest["material_id"] = df_cmp_latest["material_id"].apply(strip_apostrophe)
 df_cmp_latest["material_id"] = pd.to_numeric(df_cmp_latest["material_id"], errors="coerce")
 
 df_mat_id = df_mat.rename(columns={"id": "material_id"})[["material_id", "cena_pln", "co2e_kgkg"]]
 df_cost = df_cmp_latest.merge(df_mat_id, on="material_id", how="left")
 
-# normalizacja liczb w razie tekstów
 df_cost["masa_kgm3"] = to_num_pl(df_cost["masa_kgm3"]).fillna(0.0)
 df_cost["cena_pln"] = to_num_pl(df_cost["cena_pln"])
 df_cost["co2e_kgkg"] = to_num_pl(df_cost["co2e_kgkg"])
@@ -605,7 +747,6 @@ with del_col:
 # ---------- Wykonania + testy ----------
 if len(selected_idx):
     st.subheader("Wykonania zaznaczonych receptur")
-
     sel_keys = tbl.loc[selected_idx, ["__key_recipe_name", "__key_timestamp", "Timestamp"]]
 
     for _, row in sel_keys.iterrows():
@@ -622,17 +763,12 @@ if len(selected_idx):
             EXEC_HIST = f"{exec_ns}__hist"
             EXEC_WKEY = f"{exec_ns}__editor"
 
-            # --- lazy load wykonań z arkusza ---
             load_exec_state_from_sheet(rname, ts_raw, exec_ns)
 
             exec_df = ensure_exec_ids(st.session_state[EXEC_DF]).copy()
-
             if "Data wyk." in exec_df.columns:
                 exec_df["Data wyk."] = (
-                    exec_df["Data wyk."]
-                    .astype("object")
-                    .where(pd.notna(exec_df["Data wyk."]), "")
-                    .astype(str)
+                    exec_df["Data wyk."].astype("object").where(pd.notna(exec_df["Data wyk."]), "").astype(str)
                 )
 
             exec_df["_del"] = False
@@ -668,10 +804,7 @@ if len(selected_idx):
                         "Wykonawca/y": "",
                         "Uwagi": "",
                     }
-                    new_df = pd.concat(
-                        [st.session_state[EXEC_DF], pd.DataFrame([new_row])],
-                        ignore_index=True,
-                    )
+                    new_df = pd.concat([st.session_state[EXEC_DF], pd.DataFrame([new_row])], ignore_index=True)
                     new_df = ensure_exec_ids(new_df)
                     st.session_state[EXEC_DF] = new_df
                     st.session_state[EXEC_SNAP] = stable_json_exec(new_df)
@@ -698,9 +831,7 @@ if len(selected_idx):
             edited_no_ui = edited_exec.drop(columns=["_del"], errors="ignore").copy()
             for col_name in ["Data wyk.", "Wykonawca/y", "Uwagi"]:
                 if col_name in edited_no_ui.columns:
-                    edited_no_ui[col_name] = edited_no_ui[col_name].astype("object").where(
-                        pd.notna(edited_no_ui[col_name]), ""
-                    )
+                    edited_no_ui[col_name] = edited_no_ui[col_name].astype("object").where(pd.notna(edited_no_ui[col_name]), "")
             edited_no_ui = ensure_exec_ids(edited_no_ui)
 
             current_exec = stable_json_exec(edited_no_ui)
@@ -726,6 +857,8 @@ if len(selected_idx):
                 except Exception:
                     nr_wyk_int = idx_exec + 1
 
+                base_date = pd.to_datetime(erow.get("Data wyk.", ""), errors="coerce", dayfirst=True)
+
                 st.markdown(f"### Testy - Wykonanie {nr_wyk_int}")
 
                 tests_ns = f"tests__{rname}__{ts_raw}__{nr_wyk_int}"
@@ -733,10 +866,13 @@ if len(selected_idx):
                 TSNAP = f"{tests_ns}__snap"
                 TWKEY = f"{tests_ns}__editor"
 
-                # --- lazy load testów z arkusza ---
                 load_tests_state_from_sheet(rname, ts_raw, nr_wyk_int, tests_ns)
 
+                # Normalizacja + przeliczenia na start (żeby wiek/gęstość/wynik zawsze były)
                 tests_df = ensure_test_ids(st.session_state[TDF].copy())
+                tests_df = normalize_tests_df(tests_df, base_date)
+                st.session_state[TDF] = tests_df.copy()
+
                 tests_df["_del"] = False
 
                 edited_tests = st.data_editor(
@@ -749,8 +885,12 @@ if len(selected_idx):
                         "_del",
                         "Nr testu",
                         "Data testu",
-                        "Typ",
-                        "Wynik",
+                        "Wiek próbki [dni]",
+                        "Rodzaj",
+                        "Masa próbki [g]",
+                        "Gęstość [kg/m3]",
+                        "Siła niszcząca [kN]",
+                        "Wynik [MPa]",
                         "Wykonawca/y",
                         "Opis zniszczenia / Uwagi",
                     ],
@@ -758,29 +898,38 @@ if len(selected_idx):
                         "_del": st.column_config.CheckboxColumn("Usuń?", help="Zaznacz testy do usunięcia"),
                         "Nr testu": st.column_config.NumberColumn("Nr testu", disabled=True),
                         "Data testu": st.column_config.TextColumn("Data testu (DD-MM-YYYY)"),
-                        "Typ": st.column_config.SelectboxColumn("Typ", options=["Ściskanie", "Rozciąganie"],
-                                                                default="Ściskanie"),
-                        "Wynik": st.column_config.TextColumn("Wynik"),
+                        "Wiek próbki [dni]": st.column_config.NumberColumn("Wiek próbki [dni]", format="%.0f", disabled=True),
+                        "Rodzaj": st.column_config.SelectboxColumn("Rodzaj", options=RODZAJE, default=RODZAJE[0]),
+                        "Masa próbki [g]": st.column_config.NumberColumn("Masa próbki [g]", format="%.0f"),
+                        "Gęstość [kg/m3]": st.column_config.NumberColumn("Gęstość [kg/m³]", format="%.1f", disabled=True),
+                        "Siła niszcząca [kN]": st.column_config.NumberColumn("Siła niszcząca [kN]", format="%.2f"),
+                        "Wynik [MPa]": st.column_config.NumberColumn("Wynik [MPa]", format="%.2f", disabled=True),
                         "Wykonawca/y": st.column_config.TextColumn("Wykonawca/y"),
                         "Opis zniszczenia / Uwagi": st.column_config.TextColumn("Opis zniszczenia / Uwagi"),
                     },
+                    disabled=["Nr testu", "Wiek próbki [dni]", "Gęstość [kg/m3]", "Wynik [MPa]"],
                 )
 
                 c_add_test, c_del_test, _ = st.columns([1, 1, 4])
 
                 with c_add_test:
                     if st.button("➕ Dodaj test", key=f"{tests_ns}__add"):
-                        cur_tests = st.session_state[TDF]
+                        cur_tests = ensure_test_ids(st.session_state[TDF])
                         new_row_t = {
                             "Nr testu": None,
                             "Data testu": "",
-                            "Typ": "",
-                            "Wynik": "",
+                            "Wiek próbki [dni]": pd.NA,
+                            "Rodzaj": RODZAJE[0],
+                            "Masa próbki [g]": pd.NA,
+                            "Gęstość [kg/m3]": pd.NA,
+                            "Siła niszcząca [kN]": pd.NA,
+                            "Wynik [MPa]": pd.NA,
                             "Wykonawca/y": "",
                             "Opis zniszczenia / Uwagi": "",
                         }
                         new_tests_df = pd.concat([cur_tests, pd.DataFrame([new_row_t])], ignore_index=True)
                         new_tests_df = ensure_test_ids(new_tests_df)
+                        new_tests_df = normalize_tests_df(new_tests_df, base_date)
                         st.session_state[TDF] = new_tests_df
                         st.session_state[TSNAP] = stable_json_test(new_tests_df)
                         st.rerun()
@@ -791,6 +940,7 @@ if len(selected_idx):
                             mask_keep_t = ~edited_tests["_del"].astype(bool)
                             new_tests = edited_tests.loc[mask_keep_t].drop(columns=["_del"])
                             new_tests = ensure_test_ids(new_tests)
+                            new_tests = normalize_tests_df(new_tests, base_date)
 
                             st.session_state[TDF] = new_tests.copy()
                             st.session_state[TSNAP] = stable_json_test(new_tests)
@@ -799,38 +949,37 @@ if len(selected_idx):
                         else:
                             st.info("Nie zaznaczono żadnych testów do usunięcia (użyj kolumny 'Usuń?').")
 
-                all_tests.append(edited_tests.drop(columns=["_del"], errors="ignore").copy())
+                # Zapis zmian (auto-przeliczenie) po edycji
+                edited_no_ui = edited_tests.drop(columns=["_del"], errors="ignore").copy()
+                edited_no_ui = ensure_test_ids(edited_no_ui)
+                edited_no_ui = normalize_tests_df(edited_no_ui, base_date)
 
-            # --- Sekcja Wytrzymałość (jak w Twoim oryginale) ---
+                cur_snap = stable_json_test(edited_no_ui)
+                prev_snap = st.session_state.get(TSNAP, "")
+                if cur_snap != prev_snap:
+                    st.session_state[TDF] = edited_no_ui.copy()
+                    st.session_state[TSNAP] = cur_snap
+                    st.toast("Zapisano zmiany w 'Testach' (lokalnie w sesji).", icon="✅")
+                    st.rerun()
+
+                all_tests.append(edited_no_ui.copy())
+
+            # --- Sekcja Wytrzymałość ---
             st.markdown("## Wytrzymałość")
-            create_equiv = st.checkbox("Utwórz odpowiedniki")
+            create_equiv = st.checkbox("Utwórz odpowiedniki", key=f"equiv__{rname}__{ts_raw}")
 
             if all_tests:
                 tests_all_df = pd.concat(all_tests, ignore_index=True)
 
-                if "Data wyk." in current_exec_df.columns and not current_exec_df.empty:
-                    base_date = pd.to_datetime(current_exec_df["Data wyk."].iloc[0], errors="coerce", dayfirst=True)
-                else:
-                    base_date = pd.NaT
+                tests_all_df["wiek_dni"] = pd.to_numeric(tests_all_df["Wiek próbki [dni]"], errors="coerce")
+                tests_all_df["Wynik_num"] = pd.to_numeric(tests_all_df["Wynik [MPa]"], errors="coerce")
 
-                tests_all_df["Data testu"] = pd.to_datetime(tests_all_df["Data testu"], errors="coerce", dayfirst=True)
-                tests_all_df["wiek_dni"] = (tests_all_df["Data testu"] - base_date).dt.days
-                tests_all_df["Wynik_num"] = pd.to_numeric(tests_all_df["Wynik"], errors="coerce")
-
-                df_scisk = tests_all_df[tests_all_df["Typ"] == "Ściskanie"].dropna(subset=["wiek_dni", "Wynik_num"])
-                df_roz = tests_all_df[tests_all_df["Typ"] == "Rozciąganie"].dropna(subset=["wiek_dni", "Wynik_num"])
+                df_scisk = tests_all_df.dropna(subset=["wiek_dni", "Wynik_num"]).copy()
 
                 equiv_roz = pd.DataFrame()
-                equiv_scisk = pd.DataFrame()
-                if create_equiv:
-                    if not df_scisk.empty:
-                        equiv_roz = df_scisk.copy()
-                        equiv_roz["Wynik_num"] = 0.3 * (equiv_roz["Wynik_num"] ** (2 / 3))
-                        equiv_roz["Typ"] = "Rozciąganie (odpow.)"
-                    if not df_roz.empty:
-                        equiv_scisk = df_roz.copy()
-                        equiv_scisk["Wynik_num"] = (equiv_scisk["Wynik_num"] / 0.3) ** (3 / 2)
-                        equiv_scisk["Typ"] = "Ściskanie (odpow.)"
+                if create_equiv and not df_scisk.empty:
+                    equiv_roz = df_scisk.copy()
+                    equiv_roz["Wynik_num"] = 0.3 * (equiv_roz["Wynik_num"] ** (2 / 3))
 
                 def fit_ec2_curve(days_arr, strength_arr):
                     t = np.clip(days_arr.astype(float), 1.0, None)
@@ -857,159 +1006,105 @@ if len(selected_idx):
                     curve = f28 * beta_grid
                     return days_grid, curve
 
+                def get_value_for_day(df_points, curve_days, curve_vals, target_day, tolerance):
+                    exact = df_points[df_points["wiek_dni"] == target_day]
+                    if not exact.empty:
+                        return float(exact["Wynik_num"].iloc[0])
+
+                    if tolerance > 0:
+                        near = df_points[
+                            (df_points["wiek_dni"] >= target_day - tolerance)
+                            & (df_points["wiek_dni"] <= target_day + tolerance)
+                        ]
+                        if not near.empty:
+                            idx = (near["wiek_dni"] - target_day).abs().idxmin()
+                            return float(near.loc[idx, "Wynik_num"])
+
+                    if target_day in curve_days:
+                        val = float(curve_vals[curve_days == target_day])
+
+                        past = df_points[df_points["wiek_dni"] < target_day]
+                        future = df_points[df_points["wiek_dni"] > target_day]
+
+                        if not past.empty:
+                            past_idx = (past["wiek_dni"] - target_day).abs().idxmin()
+                            past_val = float(past.loc[past_idx, "Wynik_num"])
+                            if val < past_val:
+                                return past_val
+
+                        if not future.empty:
+                            fut_idx = (future["wiek_dni"] - target_day).abs().idxmin()
+                            fut_val = float(future.loc[fut_idx, "Wynik_num"])
+                            if val > fut_val:
+                                return fut_val
+
+                        return val
+
+                    return None
+
+                def build_table(df_points, curve_days, curve_vals):
+                    params = [("fck,3", 3, 0), ("fck,7", 7, 1), ("fck,14", 14, 1), ("fck,28", 28, 2)]
+                    rows = {}
+                    for label, day, tol in params:
+                        rows[label] = get_value_for_day(df_points, curve_days, curve_vals, day, tol)
+
+                    # monotoniczność
+                    if rows["fck,7"] is not None and rows["fck,3"] is not None and rows["fck,7"] < rows["fck,3"]:
+                        rows["fck,7"] = rows["fck,3"]
+                    if rows["fck,14"] is not None and rows["fck,7"] is not None and rows["fck,14"] < rows["fck,7"]:
+                        rows["fck,14"] = rows["fck,7"]
+                    if rows["fck,28"] is not None and rows["fck,14"] is not None and rows["fck,28"] < rows["fck,14"]:
+                        rows["fck,28"] = rows["fck,14"]
+
+                    return pd.DataFrame([{"Parametr": k, "Wartość [MPa]": (v if v is not None else "-")} for k, v in rows.items()])
+
                 col1, col2 = st.columns(2)
+
                 with col1:
-                    if (not df_scisk.empty) or (create_equiv and not equiv_scisk.empty):
+                    if not df_scisk.empty:
                         fig1, ax1 = plt.subplots(figsize=(5, 3))
-                        if not df_scisk.empty:
-                            ax1.plot(df_scisk["wiek_dni"], df_scisk["Wynik_num"], "o", color="#1f77b4")
-                        if create_equiv and not equiv_scisk.empty:
-                            ax1.plot(equiv_scisk["wiek_dni"], equiv_scisk["Wynik_num"], "x", color="#7f7f7f")
-                        if not df_scisk.empty:
-                            days_c, curve_c = fit_ec2_curve(df_scisk["wiek_dni"].values, df_scisk["Wynik_num"].values)
-                        else:
-                            days_c, curve_c = fit_ec2_curve(equiv_scisk["wiek_dni"].values, equiv_scisk["Wynik_num"].values)
+                        ax1.plot(df_scisk["wiek_dni"], df_scisk["Wynik_num"], "o", color="#1f77b4")
+                        days_c, curve_c = fit_ec2_curve(df_scisk["wiek_dni"].values, df_scisk["Wynik_num"].values)
                         ax1.plot(days_c, curve_c, "-", color="#2ca02c", linewidth=1.5)
                         ax1.set_xlabel("Wiek próbki [dni]")
                         ax1.set_ylabel("Wytrzymałość [MPa]")
                         ax1.set_title("Ściskanie — punkty + EC2 (dopas.)")
                         ax1.grid(True)
-                        max_day = max(int(np.nanmax([df_scisk["wiek_dni"].max() if not df_scisk.empty else 0,
-                                                     equiv_scisk["wiek_dni"].max() if not equiv_scisk.empty else 0])), 28)
+                        max_day = max(int(np.nanmax([df_scisk["wiek_dni"].max()])), 28)
                         ax1.set_xlim(0, max_day)
                         ax1.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
                         ax1.set_ylim(bottom=0)
                         fig1.tight_layout()
                         st.pyplot(fig1, use_container_width=False)
+
                 with col2:
-                    if (not df_roz.empty) or (create_equiv and not equiv_roz.empty):
+                    if create_equiv and not equiv_roz.empty:
                         fig2, ax2 = plt.subplots(figsize=(5, 3))
-                        if not df_roz.empty:
-                            ax2.plot(df_roz["wiek_dni"], df_roz["Wynik_num"], "o", color="#ff7f0e")
-                        if create_equiv and not equiv_roz.empty:
-                            ax2.plot(equiv_roz["wiek_dni"], equiv_roz["Wynik_num"], "x", color="#7f7f7f")
-                        if not df_roz.empty:
-                            days_t, curve_t = fit_ec2_curve(df_roz["wiek_dni"].values, df_roz["Wynik_num"].values)
-                        else:
-                            days_t, curve_t = fit_ec2_curve(equiv_roz["wiek_dni"].values, equiv_roz["Wynik_num"].values)
+                        ax2.plot(equiv_roz["wiek_dni"], equiv_roz["Wynik_num"], "x", color="#7f7f7f")
+                        days_t, curve_t = fit_ec2_curve(equiv_roz["wiek_dni"].values, equiv_roz["Wynik_num"].values)
                         ax2.plot(days_t, curve_t, "-", color="#d62728", linewidth=1.5)
                         ax2.set_xlabel("Wiek próbki [dni]")
                         ax2.set_ylabel("Wytrzymałość [MPa]")
-                        ax2.set_title("Rozciąganie — punkty + EC2 (dopas.)")
+                        ax2.set_title("Rozciąganie (odpow.) — punkty + EC2 (dopas.)")
                         ax2.grid(True)
-                        max_day = max(int(np.nanmax([df_roz["wiek_dni"].max() if not df_roz.empty else 0,
-                                                     equiv_roz["wiek_dni"].max() if not equiv_roz.empty else 0])), 28)
+                        max_day = max(int(np.nanmax([equiv_roz["wiek_dni"].max()])), 28)
                         ax2.set_xlim(0, max_day)
                         ax2.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
                         ax2.set_ylim(bottom=0)
                         fig2.tight_layout()
                         st.pyplot(fig2, use_container_width=False)
 
+                col1t, col2t = st.columns(2)
+                with col1t:
+                    if not df_scisk.empty:
+                        days_c2, curve_c2 = fit_ec2_curve(df_scisk["wiek_dni"].values, df_scisk["Wynik_num"].values)
+                        table_scisk = build_table(df_scisk, days_c2, curve_c2)
+                        st.subheader("Tabela Ściskanie")
+                        st.dataframe(table_scisk, use_container_width=True)
 
-                        # --- Funkcja pomocnicza: znajdź wartość dla danego dnia ---
-                        def get_value_for_day(df_points, curve_days, curve_vals, target_day, tolerance):
-                            """
-                            df_points: DataFrame z kolumnami wiek_dni, Wynik_num
-                            curve_days, curve_vals: krzywa EC2
-                            target_day: dzień (int)
-                            tolerance: ile dni wstecz/przód można szukać (dla 7 i 14 =1, dla 28=2, dla 3=0)
-                            """
-                            # 1. Szukaj dokładnego punktu
-                            exact = df_points[df_points["wiek_dni"] == target_day]
-                            if not exact.empty:
-                                return float(exact["Wynik_num"].iloc[0])
-
-                            # 2. Szukaj w tolerancji
-                            if tolerance > 0:
-                                near = df_points[(df_points["wiek_dni"] >= target_day - tolerance) &
-                                                 (df_points["wiek_dni"] <= target_day + tolerance)]
-                                if not near.empty:
-                                    idx = (near["wiek_dni"] - target_day).abs().idxmin()
-                                    return float(near.loc[idx, "Wynik_num"])
-
-                            # 3. Jeśli brak → weź z krzywej EC2
-                            if target_day in curve_days:
-                                val = float(curve_vals[curve_days == target_day])
-
-                                # znajdź najbliższe punkty wstecz i w przód
-                                past = df_points[df_points["wiek_dni"] < target_day]
-                                future = df_points[df_points["wiek_dni"] > target_day]
-
-                                if not past.empty:
-                                    past_val = past.iloc[(past["wiek_dni"] - target_day).abs().idxmin()]["Wynik_num"]
-                                    if val < past_val:
-                                        return float(past_val)
-
-                                if not future.empty:
-                                    future_val = future.iloc[(future["wiek_dni"] - target_day).abs().idxmin()][
-                                        "Wynik_num"]
-                                    if val > future_val:
-                                        return float(future_val)
-
-                                return val
-
-                            return None
-
-
-                        # --- Funkcja budująca tabelę z monotonicznością ---
-                        def build_table(df_points, curve_days, curve_vals):
-                            params = [("fck,3", 3, 0), ("fck,7", 7, 1), ("fck,14", 14, 1), ("fck,28", 28, 2)]
-                            rows = {}
-                            for label, day, tol in params:
-                                val = get_value_for_day(df_points, curve_days, curve_vals, day, tol)
-                                rows[label] = val if val is not None else None
-
-                            # --- zasada monotoniczności ---
-                            if rows["fck,7"] is not None and rows["fck,3"] is not None:
-                                if rows["fck,7"] < rows["fck,3"]:
-                                    rows["fck,7"] = rows["fck,3"]
-
-                            if rows["fck,14"] is not None and rows["fck,7"] is not None:
-                                if rows["fck,14"] < rows["fck,7"]:
-                                    rows["fck,14"] = rows["fck,7"]
-
-                            if rows["fck,28"] is not None and rows["fck,14"] is not None:
-                                if rows["fck,28"] < rows["fck,14"]:
-                                    rows["fck,28"] = rows["fck,14"]
-
-                            # budowa DataFrame
-                            df_out = pd.DataFrame(
-                                [{"Parametr": k, "Wartość [MPa]": v if v is not None else "-"} for k, v in
-                                 rows.items()])
-                            return df_out
-
-
-                        # --- Ściskanie: tabela pod wykresem ---
-                        with col1:
-                            if (not df_scisk.empty) or (create_equiv and not equiv_scisk.empty):
-                                df_all_scisk = pd.concat([df_scisk, equiv_scisk],
-                                                         ignore_index=True) if create_equiv else df_scisk
-                                days_c, curve_c = fit_ec2_curve(df_all_scisk["wiek_dni"].values,
-                                                                df_all_scisk["Wynik_num"].values)
-                                table_scisk = build_table(df_all_scisk, days_c, curve_c)
-                                st.subheader("Tabela Ściskanie")
-                                st.dataframe(table_scisk.to_dict(orient="records"), use_container_width=True)
-
-                        # --- Rozciąganie: tabela pod wykresem ---
-                        with col2:
-                            if (not df_roz.empty) or (create_equiv and not equiv_roz.empty):
-                                df_all_roz = pd.concat([df_roz, equiv_roz],
-                                                       ignore_index=True) if create_equiv else df_roz
-                                days_t, curve_t = fit_ec2_curve(df_all_roz["wiek_dni"].values,
-                                                                df_all_roz["Wynik_num"].values)
-                                table_roz = build_table(df_all_roz, days_t, curve_t)
-                                st.subheader("Tabela Rozciąganie")
-                                st.dataframe(table_roz.to_dict(orient="records"), use_container_width=True)
-
-
-
-
-
-
-
-
-
-
-
-
-
+                with col2t:
+                    if create_equiv and not equiv_roz.empty:
+                        days_t2, curve_t2 = fit_ec2_curve(equiv_roz["wiek_dni"].values, equiv_roz["Wynik_num"].values)
+                        table_roz = build_table(equiv_roz, days_t2, curve_t2)
+                        st.subheader("Tabela Rozciąganie (odpow.)")
+                        st.dataframe(table_roz, use_container_width=True)

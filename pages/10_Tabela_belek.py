@@ -71,6 +71,15 @@ def to_num_pl(x):
             return pd.NA
     return pd.to_numeric(x, errors="coerce")
 
+def _canon_geom(x: Any) -> str:
+    s = str(x or "").strip().lower()
+    s = s.replace(" ", "")
+    # ujednolicenia
+    if s in {"i", "prost", "prost.", "prosta", "prostokąt", "prostokat"}:
+        return "i"
+    if s in {"tpd", "t-pd", "t_pd"}:
+        return "tpd"
+    return s or "?"
 
 def _normalize_name(s: str) -> str:
     return " ".join(str(s or "").split()).strip().lower()
@@ -414,7 +423,7 @@ with btn_save_col:
     if st.button("💾 Zapisz wszystko", use_container_width=True):
         try:
             save_beam_exec_and_tests_to_sheets()
-            st.toast("Zapisano wykonania i testy do Google Sheets ✔️", icon="✅")
+            st.toast("Zapisano wykonania i testy", icon="✅")
             st.cache_data.clear()
         except Exception as e:
             st.error(f"Nie udało się zapisać wykonania/testów: {e}")
@@ -435,17 +444,100 @@ def _build_beams_view(df_src: pd.DataFrame, geom_label: str) -> pd.DataFrame:
     if df_src is None or df_src.empty:
         return pd.DataFrame()
 
-    # elastyczne mapowanie kolumn
+    # --- mapowanie kolumn (elastyczne) ---
     col_id = "ID" if "ID" in df_src.columns else None
     col_name = "Nazwa belki" if "Nazwa belki" in df_src.columns else ("Nazwa" if "Nazwa" in df_src.columns else None)
-    col_mix = "Receptura betonu" if "Receptura betonu" in df_src.columns else ("Mieszanka" if "Mieszanka" in df_src.columns else None)
 
-    # cena mieszanki [USD/m³] - jeśli nie masz tej kolumny w sheets, będzie puste
+    # u Ciebie w arkuszu bywa "Receptura beton" (bez "u")
+    col_mix = None
+    for cand in ["Receptura betonu", "Receptura beton", "Mieszanka"]:
+        if cand in df_src.columns:
+            col_mix = cand
+            break
+
+    # geometria z arkusza (jeśli jest)
+    col_geom = "Geometria" if "Geometria" in df_src.columns else None
+
+    # cena mieszanki [USD/m³]
     col_mix_price_m3 = None
-    for cand in ["Cena mieszanki [USD/m³]", "Cena mieszanki [USD/m3]", "Cena mieszanki [USD/m^3]", "Cena mieszanki / m3 [USD]", "Cena mieszanki USD/m3"]:
+    for cand in [
+        "Cena mieszanki [USD/m³]",
+        "Cena mieszanki [USD/m3]",
+        "Cena mieszanki [USD/m^3]",
+        "Cena mieszanki / m3 [USD]",
+        "Cena mieszanki USD/m3",
+    ]:
         if cand in df_src.columns:
             col_mix_price_m3 = cand
             break
+
+    # procedury
+    col_p_aci = "P_ACI_440_kN" if "P_ACI_440_kN" in df_src.columns else None
+    col_p_jsce = "P_JSCE_kN" if "P_JSCE_kN" in df_src.columns else None
+    col_p_csa = "P_CSA_kN" if "P_CSA_kN" in df_src.columns else None
+
+    # Pmin/własne + wyniki
+    col_p_min = "P_min_proc_kN" if "P_min_proc_kN" in df_src.columns else None
+    col_p_custom = "P_custom_kN" if "P_custom_kN" in df_src.columns else None
+    col_w_min = "Wynik_min_proc_USD_per_kN" if "Wynik_min_proc_USD_per_kN" in df_src.columns else None
+    col_w_custom = "Wynik_custom_USD_per_kN" if "Wynik_custom_USD_per_kN" in df_src.columns else None
+
+    # punktacja (kolumny “kosztowo-masowe”)
+    punkt_cols = [
+        "Łączna obj. belki [l]",
+        "Cena mieszanki / belkę [USD]",
+        "Łączna ilość prętów",
+        "Łączna cena zbrojenia [USD]",
+        "Całkowita masa belki [kg]",
+        "Koszt materiałów, brutto [USD]",
+        "Korekta materiałowa [%]",
+        "Koszt materiałów, netto [USD]",
+        "Korekta geometryczna [%]",
+        "Koszta transportu [USD]",
+        "Cena belki, brutto [USD]",
+        "Cena belki, netto [USD]",
+    ]
+
+    # jeśli w źródle ich nie ma, to je tworzę (żeby potem nie było KeyError)
+    for c in punkt_cols:
+        if c not in df_src.columns:
+            df_src[c] = ""
+
+    out = pd.DataFrame()
+    out["ID"] = df_src[col_id] if col_id else ""
+    out["Nazwa"] = df_src[col_name] if col_name else ""
+    out["Mieszanka"] = df_src[col_mix] if col_mix else ""
+    out["Cena mieszanki [USD/m³]"] = df_src[col_mix_price_m3] if col_mix_price_m3 else ""
+
+    # pokazuj tekst z arkusza (np. "prost."), ale kanonizuj do kluczy
+    if col_geom:
+        out["Geometria"] = df_src[col_geom].astype(str).fillna("").apply(lambda v: v.strip())
+    else:
+        out["Geometria"] = geom_label
+
+    out["__geom_id"] = out["Geometria"].apply(_canon_geom)
+
+    out["P_ACI_440 [kN]"] = df_src[col_p_aci] if col_p_aci else ""
+    out["P_JSCE [kN]"] = df_src[col_p_jsce] if col_p_jsce else ""
+    out["P_CSA [kN]"] = df_src[col_p_csa] if col_p_csa else ""
+
+    for c in punkt_cols:
+        out[c] = df_src[c]
+
+    out["P,min [kN]"] = df_src[col_p_min] if col_p_min else ""
+    out["P,własne [kN]"] = df_src[col_p_custom] if col_p_custom else ""
+    out["Wynik,min [USD/kN]"] = df_src[col_w_min] if col_w_min else ""
+    out["Wynik,własne [USD/kN]"] = df_src[col_w_custom] if col_w_custom else ""
+
+    # stabilny beam_key: używaj __geom_id (żeby "prost." -> "i")
+    def _mk_key(r):
+        rid = str(r.get("ID", "")).strip()
+        if rid:
+            return f"{r.get('__geom_id', '?')}|{rid}"
+        return f"{r.get('__geom_id', '?')}|{_normalize_name(r.get('Nazwa', ''))}"
+
+    out["__beam_key"] = out.apply(_mk_key, axis=1)
+    return out
 
     # procedury
     col_p_aci = "P_ACI_440_kN" if "P_ACI_440_kN" in df_src.columns else None
@@ -511,7 +603,8 @@ view_i = _build_beams_view(df_i, "i")
 view_tpd = _build_beams_view(df_tpd, "tpd")
 
 beams = pd.concat([view_i, view_tpd], ignore_index=True)
-beams["__geom_order"] = beams["Geometria"].map({"i": 0, "tpd": 1}).fillna(9).astype(int)
+beams["__geom_order"] = beams["__geom_id"].map({"i": 0, "tpd": 1}).fillna(9).astype(int)
+
 
 # liczby -> numeric gdzie sensownie
 num_candidates = [
@@ -535,6 +628,22 @@ num_candidates = [
 for c in num_candidates:
     if c in beams.columns:
         beams[c] = beams[c].apply(to_num_pl)
+# === wylicz Cena mieszanki [USD/m³] jeśli brak / NaN ===
+if "Cena mieszanki [USD/m³]" not in beams.columns:
+    beams["Cena mieszanki [USD/m³]"] = pd.NA
+
+# objętość w litrach -> m³
+vol_l = beams["Łączna obj. belki [l]"].apply(to_num_pl)
+price_per_beam = beams["Cena mieszanki / belkę [USD]"].apply(to_num_pl)
+
+vol_m3 = vol_l / 1000.0
+
+calc_mix_price_m3 = (price_per_beam / vol_m3.where(vol_m3 > 0)).replace([math.inf, -math.inf], pd.NA)
+
+# nadpisz tylko tam, gdzie obecna wartość jest pusta/NaN
+mask_missing = beams["Cena mieszanki [USD/m³]"].isna()
+beams.loc[mask_missing, "Cena mieszanki [USD/m³]"] = calc_mix_price_m3.loc[mask_missing]
+
 
 beams = beams.sort_values(["__geom_order", "Nazwa"], ascending=[True, True]).reset_index(drop=True)
 
@@ -564,6 +673,109 @@ beams["Wsp. Raport"] = beams["__beam_key"].apply(_get_coef)
 test_min_map = compute_test_min_per_beam()  # Series: beam_key -> min_test (kN)
 
 beams["P,min(zbadane) [kN]"] = beams["__beam_key"].map(test_min_map)
+# DEBUG: pokaż jak Pandas widzi nagłówki (widać ukryte spacje/NBSP)def _build_beams_view(df_src: pd.DataFrame, geom_label: str) -> pd.DataFrame:
+#     if df_src is None or df_src.empty:
+#         return pd.DataFrame()
+#
+#     # --- mapowanie kolumn (elastyczne) ---
+#     col_id = "ID" if "ID" in df_src.columns else None
+#     col_name = "Nazwa belki" if "Nazwa belki" in df_src.columns else ("Nazwa" if "Nazwa" in df_src.columns else None)
+#
+#     # u Ciebie w arkuszu bywa "Receptura beton" (bez "u")
+#     col_mix = None
+#     for cand in ["Receptura betonu", "Receptura beton", "Mieszanka"]:
+#         if cand in df_src.columns:
+#             col_mix = cand
+#             break
+#
+#     # geometria z arkusza (jeśli jest)
+#     col_geom = "Geometria" if "Geometria" in df_src.columns else None
+#
+#     # cena mieszanki [USD/m³]
+#     col_mix_price_m3 = None
+#     for cand in [
+#         "Cena mieszanki [USD/m³]",
+#         "Cena mieszanki [USD/m3]",
+#         "Cena mieszanki [USD/m^3]",
+#         "Cena mieszanki / m3 [USD]",
+#         "Cena mieszanki USD/m3",
+#     ]:
+#         if cand in df_src.columns:
+#             col_mix_price_m3 = cand
+#             break
+#
+#     # procedury
+#     col_p_aci = "P_ACI_440_kN" if "P_ACI_440_kN" in df_src.columns else None
+#     col_p_jsce = "P_JSCE_kN" if "P_JSCE_kN" in df_src.columns else None
+#     col_p_csa = "P_CSA_kN" if "P_CSA_kN" in df_src.columns else None
+#
+#     # Pmin/własne + wyniki
+#     col_p_min = "P_min_proc_kN" if "P_min_proc_kN" in df_src.columns else None
+#     col_p_custom = "P_custom_kN" if "P_custom_kN" in df_src.columns else None
+#     col_w_min = "Wynik_min_proc_USD_per_kN" if "Wynik_min_proc_USD_per_kN" in df_src.columns else None
+#     col_w_custom = "Wynik_custom_USD_per_kN" if "Wynik_custom_USD_per_kN" in df_src.columns else None
+#
+#     # punktacja (kolumny “kosztowo-masowe”)
+#     punkt_cols = [
+#         "Łączna obj. belki [l]",
+#         "Cena mieszanki / belkę [USD]",
+#         "Łączna ilość prętów",
+#         "Łączna cena zbrojenia [USD]",
+#         "Całkowita masa belki [kg]",
+#         "Koszt materiałów, brutto [USD]",
+#         "Korekta materiałowa [%]",
+#         "Koszt materiałów, netto [USD]",
+#         "Korekta geometryczna [%]",
+#         "Koszta transportu [USD]",
+#         "Cena belki, brutto [USD]",
+#         "Cena belki, netto [USD]",
+#     ]
+#
+#     # jeśli w źródle ich nie ma, to je tworzę (żeby potem nie było KeyError)
+#     for c in punkt_cols:
+#         if c not in df_src.columns:
+#             df_src[c] = ""
+#
+#     out = pd.DataFrame()
+#     out["ID"] = df_src[col_id] if col_id else ""
+#     out["Nazwa"] = df_src[col_name] if col_name else ""
+#     out["Mieszanka"] = df_src[col_mix] if col_mix else ""
+#     out["Cena mieszanki [USD/m³]"] = df_src[col_mix_price_m3] if col_mix_price_m3 else ""
+#
+#     # pokazuj tekst z arkusza (np. "prost."), ale kanonizuj do kluczy
+#     if col_geom:
+#         out["Geometria"] = df_src[col_geom].astype(str).fillna("").apply(lambda v: v.strip())
+#     else:
+#         out["Geometria"] = geom_label
+#
+#     out["__geom_id"] = out["Geometria"].apply(_canon_geom)
+#
+#     out["P_ACI_440 [kN]"] = df_src[col_p_aci] if col_p_aci else ""
+#     out["P_JSCE [kN]"] = df_src[col_p_jsce] if col_p_jsce else ""
+#     out["P_CSA [kN]"] = df_src[col_p_csa] if col_p_csa else ""
+#
+#     for c in punkt_cols:
+#         out[c] = df_src[c]
+#
+#     out["P,min [kN]"] = df_src[col_p_min] if col_p_min else ""
+#     out["P,własne [kN]"] = df_src[col_p_custom] if col_p_custom else ""
+#     out["Wynik,min [USD/kN]"] = df_src[col_w_min] if col_w_min else ""
+#     out["Wynik,własne [USD/kN]"] = df_src[col_w_custom] if col_w_custom else ""
+#
+#     # stabilny beam_key: używaj __geom_id (żeby "prost." -> "i")
+#     def _mk_key(r):
+#         rid = str(r.get("ID", "")).strip()
+#         if rid:
+#             return f"{r.get('__geom_id', '?')}|{rid}"
+#         return f"{r.get('__geom_id', '?')}|{_normalize_name(r.get('Nazwa', ''))}"
+#
+#     out["__beam_key"] = out.apply(_mk_key, axis=1)
+#     return out
+
+
+# AWARYJNIE: jeżeli kolumny nie ma, utwórz ją pustą (żeby app nie padała)
+if "Cena belki, netto [USD]" not in beams.columns:
+    beams["Cena belki, netto [USD]"] = pd.NA
 price_netto = beams["Cena belki, netto [USD]"].apply(to_num_pl)
 pmin_zbad = beams["P,min(zbadane) [kN]"].apply(to_num_pl)
 
@@ -676,7 +888,7 @@ selected_idx = edited.index[edited["__select__"] == True] if "__select__" in edi
 # Expandery: wykonania + testy (bez wyboru typu)
 # ============================================================
 if len(selected_idx):
-    st.subheader("Wykonania i testy (zaznaczone belki)")
+    st.subheader("Wykonania i testy")
 
     for irow in selected_idx:
         row = beams.loc[irow]
@@ -810,7 +1022,7 @@ if len(selected_idx):
                         "_del": st.column_config.CheckboxColumn("Usuń?", help="Zaznacz testy do usunięcia"),
                         "Nr testu": st.column_config.NumberColumn("Nr testu", disabled=True),
                         "Data testu": st.column_config.TextColumn("Data testu (DD-MM-YYYY)"),
-                        "Wynik": st.column_config.TextColumn("Wynik (np. kN)"),
+                        "Wynik": st.column_config.TextColumn("Wynik [kN]"),
                         "Wykonawca/y": st.column_config.TextColumn("Wykonawca/y"),
                         "Uwagi": st.column_config.TextColumn("Uwagi"),
                     },

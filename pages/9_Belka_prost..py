@@ -2192,7 +2192,7 @@ def _build_beam_row(beam_name: str) -> List[Any]:
         "",  # ID (nadamy przy zapisie)
         beam_name.strip(),
         str(recipe_name),
-        "i",  # ✅ geometria
+        "prost.",  # ✅ geometria
         P_ACI, P_JSCE, P_CSA,
         P_custom,
         P_min_proc,
