@@ -195,7 +195,7 @@ LAYOUT = [1, 1, 8]
 # === GÓRNY pasek akcji ===
 c_save, c_update, _sp_top = st.columns(LAYOUT)
 with c_save:
-    if st.button("💾 Zapisz (Google Sheets)", use_container_width=True):
+    if st.button("💾 Zapisz", use_container_width=True):
         if not GS_READY:
             st.error("Brak konfiguracji Google Sheets w secrets. Uzupełnij SPREADSHEET_ID i [gcp_service_account].")
         else:
@@ -210,7 +210,7 @@ with c_save:
                 st.error(f"Nie udało się zapisać do Google Sheets: {e}")
 
 with c_update:
-    if st.button("↻ Zaktualizuj z Google Sheets", use_container_width=True):
+    if st.button("↻ Zaktualizuj", use_container_width=True):
         if not GS_READY:
             st.error("Brak konfiguracji Google Sheets w secrets. Uzupełnij SPREADSHEET_ID i [gcp_service_account].")
         else:

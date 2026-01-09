@@ -682,7 +682,7 @@ cols_display = [
     "fck_teoretyczne_col",
 ]
 
-st.subheader("Tabela mieszanek")
+
 edited = st.data_editor(
     display_df[cols_display],
     use_container_width=True,
