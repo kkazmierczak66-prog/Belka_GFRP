@@ -59,6 +59,18 @@ def to_num_series(s: pd.Series) -> pd.Series:
         errors="coerce",
     )
 
+def scale_txt_cell(txt: Any, factor: float, nd: int = 3) -> str:
+    """Skaluje wartość zapisaną jako tekst. Puste zostawia puste.
+    Jeśli nie da się sparsować (np. ktoś wpisał literę), zostawia oryginał."""
+    if txt is None:
+        return ""
+    s = str(txt).strip()
+    if s == "":
+        return ""
+    v = to_num_val(s)
+    if pd.isna(v):
+        return s
+    return fmt_num(v * factor, nd)
 
 def to_num_val(x) -> float:
     """Odporne parsowanie pojedynczej wartości (np. z data_editor),
@@ -441,6 +453,50 @@ with st.container():
 # ---------------- Layout ----------------
 col_left, col_right = st.columns([2, 3])
 
+
+def _compute_sum_percent_live() -> float:
+    # kruszywo razem
+    kr = to_num_val(st.session_state.get("kruszywo_total_txt", "0"))
+    if pd.isna(kr):
+        kr = 0.0
+    total = float(kr)
+
+    # pozostałe kategorie: sumujemy udzial_txt
+    for cat_key in ["spoiwo", "dodatek", "woda", "domieszka"]:
+        skey = f"tbl_{cat_key}"
+        df = st.session_state.get(skey)
+        if isinstance(df, pd.DataFrame) and not df.empty and "udzial_txt" in df.columns:
+            vals = df["udzial_txt"].astype(str).apply(to_num_val).fillna(0.0)
+            total += float(vals.sum())
+
+    return float(total)
+
+
+def normalize_all_to_100_callback():
+    s = _compute_sum_percent_live()
+    if s <= 0 or math.isnan(s):
+        st.session_state["_norm_msg"] = "Nie da się znormalizować: suma udziałów wynosi 0%."
+        return
+
+    factor = 100.0 / s
+
+    # 1) kruszywo razem
+    kr = to_num_val(st.session_state.get("kruszywo_total_txt", "0"))
+    if pd.isna(kr):
+        kr = 0.0
+    st.session_state["kruszywo_total_txt"] = fmt_num(float(kr) * factor, 3)
+
+    # 2) pozostałe kategorie: skaluje tylko udzial_txt
+    for cat_key in ["spoiwo", "dodatek", "woda", "domieszka"]:
+        skey = f"tbl_{cat_key}"
+        df = st.session_state.get(skey)
+        if isinstance(df, pd.DataFrame) and not df.empty and "udzial_txt" in df.columns:
+            df2 = df.copy()
+            df2["udzial_txt"] = df2["udzial_txt"].apply(lambda x: scale_txt_cell(x, factor, 3))
+            st.session_state[skey] = df2
+
+    st.session_state["_norm_msg"] = f"Przeskalowano udziały x{factor:.6f} → suma ≈ 100%."
+
 # ============================================================
 # LEWA KOLUMNA: wybór + edycja udziałów (LIVE, bez cofek)
 # ============================================================
@@ -733,6 +789,21 @@ with col_right:
         st.warning("Suma udziałów wynosi 0%. Ustaw niezerowe udziały dla wybranych materiałów.")
     elif abs(sum_percent - 100.0) > 0.5:
         st.warning(f"Suma udziałów to **{sum_percent:.2f}%**. Dla pełnego 1 m³ powinna wynosić **100%**.")
+
+####NORMALIZACJA
+    st.markdown("---")
+    st.subheader("Normalizacja udziałów")
+
+    st.button(
+        "⚖️ Normalizuj wszystkie udziały do 100% (skalowanie)",
+        use_container_width=True,
+        on_click=normalize_all_to_100_callback,
+    )
+
+    # komunikat po normalizacji
+    if st.session_state.get("_norm_msg"):
+        st.info(st.session_state["_norm_msg"])
+
 
     # ============================================================
     # ZAPIS DO GOOGLE SHEETS
