@@ -1,8 +1,9 @@
 # 3_Receptura_fixed.py
 # - Wczytywanie receptury z arkusza (selectbox + przycisk "Wczytaj")
 # - Domieszki traktowane jak normalne składniki (udział objętościowy, bilans, koszt, CO2)
-# - Odporne parsowanie liczb z przecinkiem i odstępami
+# - Odporne parsowanie liczb z przecinkiem i odstępami (również w data_editor)
 # - Stabilne ID w edytorach (brak utraty fokusa)
+# - Kruszywo: USUNIĘTA autokorekta / „wyrównywanie” inputów frakcji (normalize tylko do obliczeń)
 # - Zapis do Google Sheets + __SUMMARY__
 
 import math
@@ -55,6 +56,22 @@ def to_num_series(s: pd.Series) -> pd.Series:
         .str.replace(",", ".", regex=False),
         errors="coerce",
     )
+
+
+def to_num_val(x) -> float:
+    """Odporne parsowanie pojedynczej wartości (np. z data_editor), obsługa przecinka i spacji."""
+    if x is None:
+        return math.nan
+    if isinstance(x, (int, float)) and not (isinstance(x, float) and math.isnan(x)):
+        return float(x)
+    s = (
+        str(x)
+        .replace("\xa0", " ")  # NBSP
+        .replace(" ", "")
+        .replace(",", ".")
+        .strip()
+    )
+    return pd.to_numeric(s, errors="coerce")
 
 
 # ---------------- Streamlit Page Setup ----------------
@@ -488,9 +505,10 @@ with col_left:
                 column_config={"nazwa": st.column_config.TextColumn("nazwa", disabled=True)},
             )
             if edited_total is not None and not edited_total.empty:
-                val = pd.to_numeric(edited_total.iloc[0]["Udział objętościowy [%]"], errors="coerce")
+                val = to_num_val(edited_total.iloc[0]["Udział objętościowy [%]"])
                 st.session_state["kruszywo_total_pct"] = float(val) if pd.notna(val) else 0.0
 
+            # jeśli nie ma splitu, zainicjuj na bazie aktualnych udziałów obj.
             if "share_in_agg_pct" not in tbl.columns:
                 prev_udzial = pd.to_numeric(tbl.get("udzial_pct", 0.0), errors="coerce").fillna(0.0)
                 total_prev = float(prev_udzial.sum())
@@ -522,21 +540,32 @@ with col_left:
 
             if edited_split is not None and not edited_split.empty:
                 ed = edited_split.rename(columns={"Udział w kruszywie [%]": "share_in_agg_pct"}).copy()
-                ed["share_in_agg_pct"] = pd.to_numeric(ed["share_in_agg_pct"], errors="coerce").fillna(0.0)
-                st.session_state[skey] = apply_edited_back(tbl, ed[["id", "share_in_agg_pct"]], {"share_in_agg_pct": "share_in_agg_pct"})
+                ed["share_in_agg_pct"] = ed["share_in_agg_pct"].apply(to_num_val).fillna(0.0)
+                st.session_state[skey] = apply_edited_back(
+                    tbl,
+                    ed[["id", "share_in_agg_pct"]],
+                    {"share_in_agg_pct": "share_in_agg_pct"}
+                )
                 tbl = ensure_table_columns(st.session_state[skey].copy())
 
-            share_sum = float(pd.to_numeric(tbl["share_in_agg_pct"], errors="coerce").fillna(0.0).sum())
-            if share_sum <= 0:
-                n = max(len(tbl), 1)
-                tbl["share_in_agg_pct"] = 100.0 / n
-                share_sum = 100.0
-
+            # ====== KLUCZOWA ZMIANA: brak autokorekty inputów ======
             tbl["share_in_agg_pct"] = pd.to_numeric(tbl["share_in_agg_pct"], errors="coerce").fillna(0.0)
-            tbl["share_in_agg_pct"] = tbl["share_in_agg_pct"] * (100.0 / share_sum)
-
+            share_sum = float(tbl["share_in_agg_pct"].sum())
             total_pct = float(st.session_state.get("kruszywo_total_pct", 0.0))
-            tbl["udzial_pct"] = (tbl["share_in_agg_pct"] / 100.0) * total_pct
+
+            # informacja zamiast automatycznej normalizacji w tabeli
+            if len(tbl) > 0 and abs(share_sum - 100.0) > 0.5 and share_sum > 0:
+                st.info(
+                    f"Suma 'Udział w kruszywie' = {share_sum:.2f}%. "
+                    "Nie koryguję automatycznie; do obliczeń normalizuję proporcjonalnie."
+                )
+
+            # normalizacja WYŁĄCZNIE do wyliczenia udziału objętościowego frakcji
+            if share_sum > 0:
+                tbl["udzial_pct"] = (tbl["share_in_agg_pct"] / share_sum) * total_pct
+            else:
+                tbl["udzial_pct"] = 0.0
+
             st.session_state[skey] = tbl.reset_index(drop=True).copy()
             continue
 
@@ -561,7 +590,7 @@ with col_left:
 
         if edited is not None and not edited.empty:
             ed = edited.rename(columns={"Udział objętościowy [%]": "udzial_pct"}).copy()
-            ed["udzial_pct"] = pd.to_numeric(ed["udzial_pct"], errors="coerce").fillna(0.0)
+            ed["udzial_pct"] = ed["udzial_pct"].apply(to_num_val).fillna(0.0)
             if "id" not in ed.columns:
                 ed["id"] = tbl["id"].values
             st.session_state[skey] = apply_edited_back(tbl, ed, {"udzial_pct": "udzial_pct"}).reset_index(drop=True)
