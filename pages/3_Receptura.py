@@ -1,9 +1,11 @@
 # 3_Receptura_fixed.py
 # - Wczytywanie receptury z arkusza (selectbox + przycisk "Wczytaj")
 # - Domieszki traktowane jak normalne składniki (udział objętościowy, bilans, koszt, CO2)
-# - Odporne parsowanie liczb z przecinkiem i odstępami (również w data_editor)
+# - Odporne parsowanie liczb z przecinkiem i odstępami
 # - Stabilne ID w edytorach (brak utraty fokusa)
-# - Kruszywo: USUNIĘTA autokorekta / „wyrównywanie” inputów frakcji (normalize tylko do obliczeń)
+# - Kruszywo: brak autokorekty inputów frakcji; normalizacja tylko do obliczeń
+# - LIVE bez "zatwierdź": tabele nie są przebudowywane co rerun, tylko gdy zmieni się wybór
+# - Edycja liczb jako tekst (żeby "12,5" nie robiło NaN->0 i nie powodowało cofek)
 # - Zapis do Google Sheets + __SUMMARY__
 
 import math
@@ -59,19 +61,32 @@ def to_num_series(s: pd.Series) -> pd.Series:
 
 
 def to_num_val(x) -> float:
-    """Odporne parsowanie pojedynczej wartości (np. z data_editor), obsługa przecinka i spacji."""
+    """Odporne parsowanie pojedynczej wartości (np. z data_editor),
+    obsługa przecinka i spacji, zwraca float lub nan."""
     if x is None:
         return math.nan
     if isinstance(x, (int, float)) and not (isinstance(x, float) and math.isnan(x)):
         return float(x)
     s = (
         str(x)
-        .replace("\xa0", " ")  # NBSP
+        .replace("\xa0", " ")
         .replace(" ", "")
         .replace(",", ".")
         .strip()
     )
     return pd.to_numeric(s, errors="coerce")
+
+
+def fmt_num(x: Any, nd: int = 3) -> str:
+    """Format do trzymania w polu tekstowym edycji."""
+    try:
+        v = float(x)
+        if math.isnan(v):
+            return ""
+        # bez naukowego
+        return f"{v:.{nd}f}".rstrip("0").rstrip(".")
+    except Exception:
+        return ""
 
 
 # ---------------- Streamlit Page Setup ----------------
@@ -121,47 +136,26 @@ def ensure_table_columns(tbl: pd.DataFrame) -> pd.DataFrame:
         else:
             t["udzial_pct"] = 0.0
 
-    t["id"] = pd.to_numeric(t["id"], errors="coerce")
-    t["udzial_pct"] = pd.to_numeric(t["udzial_pct"], errors="coerce").fillna(0.0)
-    t["gestosc_kgm3"] = pd.to_numeric(t["gestosc_kgm3"], errors="coerce")
+    # kolumny tekstowe do edycji (ważne: edytujemy tekst, nie float)
+    if "udzial_txt" not in t.columns:
+        t["udzial_txt"] = t["udzial_pct"].apply(lambda x: fmt_num(x, 3))
 
-    tech_cols = ["id", "nazwa", "kategoria", "gestosc_kgm3", "udzial_pct"]
+    if "share_in_agg_pct" not in t.columns:
+        # dla nie-kruszywa nieistotne, ale zostawiamy opcjonalnie
+        pass
+    if "share_in_agg_txt" not in t.columns:
+        if "share_in_agg_pct" in t.columns:
+            t["share_in_agg_txt"] = t["share_in_agg_pct"].apply(lambda x: fmt_num(x, 3))
+        else:
+            t["share_in_agg_txt"] = ""
+
+    t["id"] = pd.to_numeric(t["id"], errors="coerce")
+    t["gestosc_kgm3"] = pd.to_numeric(t["gestosc_kgm3"], errors="coerce")
+    # uwaga: udzial_pct będziemy liczyć dynamicznie z udzial_txt/share_in_agg_txt
+
+    tech_cols = ["id", "nazwa", "kategoria", "gestosc_kgm3", "udzial_pct", "udzial_txt", "share_in_agg_txt"]
     rest = [c for c in t.columns if c not in tech_cols]
     return t[tech_cols + rest]
-
-
-def apply_edited_back(original_tbl: pd.DataFrame, edited_tbl: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
-    orig = original_tbl.copy()
-    ed = edited_tbl.copy()
-    if "id" not in ed.columns and "id" in orig.columns:
-        ed["id"] = orig["id"].values
-
-    orig_idx = orig.set_index("id", drop=False)
-    ed_idx = ed.set_index("id", drop=False)
-
-    orig_idx = orig_idx[~orig_idx.index.duplicated(keep="first")]
-    ed_idx = ed_idx[~ed_idx.index.duplicated(keep="first")]
-
-    num_cols = set(orig.select_dtypes(include=["number"]).columns.tolist())
-
-    for inp_col, tech_col in mapping.items():
-        if inp_col not in ed_idx.columns:
-            continue
-        common = orig_idx.index.intersection(ed_idx.index)
-        if common.empty:
-            continue
-        for i in common:
-            new_val = ed_idx.at[i, inp_col]
-            if pd.isna(new_val) or (isinstance(new_val, str) and new_val.strip() == ""):
-                continue
-            if tech_col in num_cols:
-                coerced = pd.to_numeric(new_val, errors="coerce")
-                if pd.notna(coerced):
-                    orig_idx.at[i, tech_col] = coerced
-            else:
-                orig_idx.at[i, tech_col] = new_val
-
-    return orig_idx.reset_index(drop=True)
 
 
 @st.cache_data(show_spinner=False)
@@ -229,13 +223,12 @@ def options_for_category(df: pd.DataFrame, cat: str) -> Dict[int, str]:
     return dict(zip(sdf["id"].tolist(), sdf["nazwa"].astype(str).tolist()))
 
 
-def build_table_for_selection(df_all: pd.DataFrame, ids: List[int], cat_key: str) -> pd.DataFrame:
+def build_table_for_selection(df_all: pd.DataFrame, ids: List[int]) -> pd.DataFrame:
     ids = [int(x) for x in ids]
     if not ids:
-        return pd.DataFrame(columns=["id", "nazwa", "kategoria", "gestosc_kgm3", "udzial_pct"])
+        return pd.DataFrame(columns=["id", "nazwa", "kategoria", "gestosc_kgm3", "udzial_pct", "udzial_txt", "share_in_agg_txt"])
     t = df_all[df_all["id"].isin(ids)].copy()
     t = ensure_table_columns(t)
-    t["udzial_pct"] = pd.to_numeric(t.get("udzial_pct", 0.0), errors="coerce").fillna(0.0)
     t = t.sort_values("id").drop_duplicates(subset=["id"], keep="first").reset_index(drop=True)
     return t
 
@@ -278,11 +271,21 @@ def read_recipes_rows(spreadsheet_id: str, sheet_name: str) -> pd.DataFrame:
 
 
 def apply_loaded_recipe(df_loaded: pd.DataFrame, df_all: pd.DataFrame):
+    # reset selekcji i tabel
     for cat_key, _ in CATEGORIES_ORDERED:
         st.session_state[f"msel_{cat_key}"] = []
         st.session_state.pop(f"tbl_{cat_key}", None)
+        st.session_state.pop(f"ids_{cat_key}", None)
 
     existing_ids = set(df_all["id"].astype(int).tolist())
+
+    # total kruszywa z receptury (sum udzial_pct kruszywo)
+    kr_total = float(
+        pd.to_numeric(df_loaded.loc[df_loaded["kategoria"].astype(str).str.strip().eq("kruszywo"), "udzial_pct"], errors="coerce")
+        .fillna(0.0)
+        .sum()
+    )
+    st.session_state["kruszywo_total_txt"] = fmt_num(kr_total, 3)
 
     for cat_key, _ in CATEGORIES_ORDERED:
         sdf = df_loaded[df_loaded["kategoria"].astype(str).str.strip().eq(cat_key)].copy()
@@ -296,27 +299,32 @@ def apply_loaded_recipe(df_loaded: pd.DataFrame, df_all: pd.DataFrame):
         if sdf.empty:
             continue
 
-        st.session_state[f"msel_{cat_key}"] = sdf["id"].tolist()
+        ids = sdf["id"].tolist()
+        st.session_state[f"msel_{cat_key}"] = ids
 
-        base_tbl = build_table_for_selection(df_all, st.session_state[f"msel_{cat_key}"], cat_key)
+        base_tbl = build_table_for_selection(df_all, ids)
         base_tbl = ensure_table_columns(base_tbl)
 
         ud_map = dict(zip(
             sdf["id"].astype(int).tolist(),
             pd.to_numeric(sdf["udzial_pct"], errors="coerce").fillna(0.0).tolist()
         ))
-        base_tbl["udzial_pct"] = base_tbl["id"].astype(int).map(ud_map).fillna(0.0)
 
         if cat_key == "kruszywo":
-            total_pct = float(pd.to_numeric(base_tbl["udzial_pct"], errors="coerce").fillna(0.0).sum())
-            st.session_state["kruszywo_total_pct"] = round(total_pct, 4)
-            if total_pct > 0:
-                base_tbl["share_in_agg_pct"] = (base_tbl["udzial_pct"] / total_pct) * 100.0
+            # share txt jako procent w kruszywie (z udzial_pct / kr_total)
+            if kr_total > 0:
+                base_tbl["share_in_agg_txt"] = base_tbl["id"].map(lambda i: fmt_num((ud_map.get(int(i), 0.0) / kr_total) * 100.0, 3))
             else:
                 n = max(len(base_tbl), 1)
-                base_tbl["share_in_agg_pct"] = 100.0 / n
+                base_tbl["share_in_agg_txt"] = [fmt_num(100.0 / n, 3)] * len(base_tbl)
+
+            # udzial_txt nieużywany dla kruszywa (liczymy z share + total), ale zostawmy spójnie
+            base_tbl["udzial_txt"] = base_tbl["id"].map(lambda i: fmt_num(ud_map.get(int(i), 0.0), 3))
+        else:
+            base_tbl["udzial_txt"] = base_tbl["id"].map(lambda i: fmt_num(ud_map.get(int(i), 0.0), 3))
 
         st.session_state[f"tbl_{cat_key}"] = base_tbl.reset_index(drop=True).copy()
+        st.session_state[f"ids_{cat_key}"] = tuple(sorted(ids))
 
 
 # ---------------- Przyciski / odświeżenie cache ----------------
@@ -382,7 +390,6 @@ else:
         )
 
     with load_col2:
-        # spacer o wysokości etykiety po lewej, żeby przycisk zrównał się z polem wyboru
         st.markdown("&nbsp;")
         do_load = st.button(
             "⬇️ Wczytaj",
@@ -435,10 +442,14 @@ with st.container():
 col_left, col_right = st.columns([2, 3])
 
 # ============================================================
-# LEWA KOLUMNA: wybór + edycja udziałów
+# LEWA KOLUMNA: wybór + edycja udziałów (LIVE, bez cofek)
 # ============================================================
 with col_left:
     st.markdown("## Wybór i udziały składników")
+
+    # init kruszywo total jako tekst
+    if "kruszywo_total_txt" not in st.session_state:
+        st.session_state["kruszywo_total_txt"] = "0"
 
     for cat_key, cat_title in CATEGORIES_ORDERED:
         st.subheader(cat_title)
@@ -449,6 +460,7 @@ with col_left:
         opts = options_for_category(df_all, cat_key)
 
         current_sel = st.session_state.get(sel_key, [])
+        # sanitizacja
         current_sel = [int(x) for x in current_sel if str(x).strip() != "" and str(x).lstrip("-").replace(".", "", 1).isdigit()]
         current_sel = [x for x in current_sel if x in opts.keys()]
         if st.session_state.get(sel_key, []) != current_sel:
@@ -462,140 +474,123 @@ with col_left:
             placeholder="Wybierz składniki",
             label_visibility="collapsed",
         )
+
         sel: List[int] = st.session_state.get(sel_key, [])
+        sel_ids_tuple = tuple(sorted([int(x) for x in sel]))
 
-        base_tbl = build_table_for_selection(df_all, sel, cat_key)
         skey = f"tbl_{cat_key}"
+        prev_ids = st.session_state.get(f"ids_{cat_key}", tuple())
 
-        base_tbl_i = ensure_table_columns(base_tbl).set_index("id", drop=False)
-        base_tbl_i = base_tbl_i[~base_tbl_i.index.duplicated(keep="first")]
+        # REBUILD TABELI tylko jeśli zmienił się wybór (to mocno redukuje cofki)
+        if sel_ids_tuple != prev_ids:
+            base_tbl = build_table_for_selection(df_all, list(sel_ids_tuple))
+            base_tbl = ensure_table_columns(base_tbl)
 
-        if skey not in st.session_state or not isinstance(st.session_state[skey], pd.DataFrame):
-            st.session_state[skey] = base_tbl_i.reset_index(drop=True).copy()
-        else:
-            cur = ensure_table_columns(st.session_state[skey]).set_index("id", drop=False)
-            cur = cur[~cur.index.duplicated(keep="first")]
-            cur_u = cur[["udzial_pct"]] if "udzial_pct" in cur.columns else pd.DataFrame(columns=["udzial_pct"])
-            merged = base_tbl_i.join(cur_u, how="left", rsuffix="_cur")
-            if "udzial_pct_cur" in merged.columns:
-                merged["udzial_pct"] = merged["udzial_pct_cur"].combine_first(merged["udzial_pct"])
-                merged = merged.drop(columns=["udzial_pct_cur"])
-            merged["udzial_pct"] = pd.to_numeric(merged["udzial_pct"], errors="coerce").fillna(0.0)
-            st.session_state[skey] = merged.reset_index(drop=True).copy()
+            # zachowaj edycje z poprzedniej tabeli, jeśli były
+            if skey in st.session_state and isinstance(st.session_state[skey], pd.DataFrame) and not st.session_state[skey].empty:
+                old = ensure_table_columns(st.session_state[skey].copy())
+                old["id"] = pd.to_numeric(old["id"], errors="coerce")
+                old = old.dropna(subset=["id"]).copy()
+                old["id"] = old["id"].astype(int)
+                old = old.drop_duplicates(subset=["id"], keep="first").set_index("id")
 
-        tbl = ensure_table_columns(st.session_state[skey].copy())
+                # tekstowe udziały
+                if "udzial_txt" in old.columns:
+                    m = old["udzial_txt"].to_dict()
+                    base_tbl["udzial_txt"] = base_tbl["id"].astype(int).map(m).combine_first(base_tbl["udzial_txt"])
 
-        # --- kruszywo special: total + split ---
+                if cat_key == "kruszywo" and "share_in_agg_txt" in old.columns:
+                    m2 = old["share_in_agg_txt"].to_dict()
+                    base_tbl["share_in_agg_txt"] = base_tbl["id"].astype(int).map(m2).combine_first(base_tbl["share_in_agg_txt"])
+
+            # init kruszywo split jeśli puste
+            if cat_key == "kruszywo":
+                # jeśli wczytane udzial_txt ma jakieś wartości, spróbuj z nich zrobić share
+                if (base_tbl["share_in_agg_txt"].astype(str).str.strip() == "").all():
+                    # z udzial_txt lub udzial_pct
+                    ud = base_tbl["udzial_txt"].apply(to_num_val).fillna(0.0)
+                    s = float(ud.sum())
+                    if s > 0:
+                        base_tbl["share_in_agg_txt"] = (ud / s * 100.0).apply(lambda v: fmt_num(v, 3))
+                    else:
+                        n = max(len(base_tbl), 1)
+                        base_tbl["share_in_agg_txt"] = [fmt_num(100.0 / n, 3)] * len(base_tbl)
+
+                # jeśli total nieustawiony, ustaw na sumę udzial_txt
+                if "kruszywo_total_txt" not in st.session_state or str(st.session_state["kruszywo_total_txt"]).strip() == "":
+                    st.session_state["kruszywo_total_txt"] = fmt_num(float(base_tbl["udzial_txt"].apply(to_num_val).fillna(0.0).sum()), 3)
+
+            st.session_state[skey] = base_tbl.reset_index(drop=True).copy()
+            st.session_state[f"ids_{cat_key}"] = sel_ids_tuple
+
+        tbl = ensure_table_columns(st.session_state.get(skey, pd.DataFrame()).copy())
+        if tbl.empty:
+            continue
+
+        # --- kruszywo: total + split (LIVE, edycja tekstowa) ---
         if cat_key == "kruszywo":
-            if "kruszywo_total_pct" not in st.session_state:
-                prev_sum = float(pd.to_numeric(tbl.get("udzial_pct", 0.0), errors="coerce").fillna(0.0).sum())
-                st.session_state["kruszywo_total_pct"] = round(prev_sum, 2)
-
-            total_df = pd.DataFrame([{
-                "nazwa": "Kruszywo (razem)",
-                "Udział objętościowy [%]": float(st.session_state["kruszywo_total_pct"])
-            }])
-
-            edited_total = st.data_editor(
-                total_df.set_index(pd.Index([int(-1)]), drop=False),
-                key="editor_kruszywo_total",
-                hide_index=True,
-                use_container_width=True,
-                num_rows="fixed",
-                column_config={"nazwa": st.column_config.TextColumn("nazwa", disabled=True)},
+            st.text_input(
+                "Kruszywo (razem) — Udział objętościowy [%]",
+                key="kruszywo_total_txt",
+                label_visibility="visible",
             )
-            if edited_total is not None and not edited_total.empty:
-                val = to_num_val(edited_total.iloc[0]["Udział objętościowy [%]"])
-                st.session_state["kruszywo_total_pct"] = float(val) if pd.notna(val) else 0.0
-
-            # jeśli nie ma splitu, zainicjuj na bazie aktualnych udziałów obj.
-            if "share_in_agg_pct" not in tbl.columns:
-                prev_udzial = pd.to_numeric(tbl.get("udzial_pct", 0.0), errors="coerce").fillna(0.0)
-                total_prev = float(prev_udzial.sum())
-                if total_prev > 0:
-                    tbl["share_in_agg_pct"] = (prev_udzial / total_prev) * 100.0
-                else:
-                    n = max(len(tbl), 1)
-                    tbl["share_in_agg_pct"] = 100.0 / n
-            else:
-                tbl["share_in_agg_pct"] = pd.to_numeric(tbl["share_in_agg_pct"], errors="coerce").fillna(0.0)
 
             split_view = (
-                tbl[["id", "nazwa", "share_in_agg_pct"]]
-                .rename(columns={"share_in_agg_pct": "Udział w kruszywie [%]"})
+                tbl[["id", "nazwa", "share_in_agg_txt"]]
+                .rename(columns={"share_in_agg_txt": "Udział w kruszywie [%]"})
                 .set_index("id", drop=False)
             )
 
             edited_split = st.data_editor(
                 split_view,
-                key="editor_kruszywo_split",
+                key="editor_kruszywo_split_txt",
                 hide_index=True,
                 use_container_width=True,
                 num_rows="fixed",
                 column_config={
                     "id": st.column_config.NumberColumn("ID", disabled=True),
                     "nazwa": st.column_config.TextColumn("nazwa", disabled=True),
+                    "Udział w kruszywie [%]": st.column_config.TextColumn("Udział w kruszywie [%]"),
                 },
             )
 
             if edited_split is not None and not edited_split.empty:
-                ed = edited_split.rename(columns={"Udział w kruszywie [%]": "share_in_agg_pct"}).copy()
-                ed["share_in_agg_pct"] = ed["share_in_agg_pct"].apply(to_num_val).fillna(0.0)
-                st.session_state[skey] = apply_edited_back(
-                    tbl,
-                    ed[["id", "share_in_agg_pct"]],
-                    {"share_in_agg_pct": "share_in_agg_pct"}
-                )
-                tbl = ensure_table_columns(st.session_state[skey].copy())
+                # update tylko kolumny tekstowej, bez żadnych normalize/astype
+                ed = edited_split.reset_index(drop=True).copy()
+                ed = ed.rename(columns={"Udział w kruszywie [%]": "share_in_agg_txt"})
+                # mapowanie po ID
+                m = dict(zip(ed["id"].astype(int).tolist(), ed["share_in_agg_txt"].astype(str).tolist()))
+                tbl["share_in_agg_txt"] = tbl["id"].astype(int).map(m).fillna(tbl["share_in_agg_txt"])
+                st.session_state[skey] = tbl.copy()
 
-            # ====== KLUCZOWA ZMIANA: brak autokorekty inputów ======
-            tbl["share_in_agg_pct"] = pd.to_numeric(tbl["share_in_agg_pct"], errors="coerce").fillna(0.0)
-            share_sum = float(tbl["share_in_agg_pct"].sum())
-            total_pct = float(st.session_state.get("kruszywo_total_pct", 0.0))
-
-            # informacja zamiast automatycznej normalizacji w tabeli
-            if len(tbl) > 0 and abs(share_sum - 100.0) > 0.5 and share_sum > 0:
-                st.info(
-                    f"Suma 'Udział w kruszywie' = {share_sum:.2f}%. "
-                    "Nie koryguję automatycznie; do obliczeń normalizuję proporcjonalnie."
-                )
-
-            # normalizacja WYŁĄCZNIE do wyliczenia udziału objętościowego frakcji
-            if share_sum > 0:
-                tbl["udzial_pct"] = (tbl["share_in_agg_pct"] / share_sum) * total_pct
-            else:
-                tbl["udzial_pct"] = 0.0
-
-            st.session_state[skey] = tbl.reset_index(drop=True).copy()
             continue
 
-        # --- wszystkie inne (w tym domieszka): jak normalne ---
+        # --- inne kategorie (w tym domieszka): edycja tekstowa udziału obj. ---
         df_for_edit = (
-            tbl[["id", "nazwa", "udzial_pct"]]
-            .rename(columns={"udzial_pct": "Udział objętościowy [%]"})
+            tbl[["id", "nazwa", "udzial_txt"]]
+            .rename(columns={"udzial_txt": "Udział objętościowy [%]"})
             .set_index("id", drop=False)
         )
 
         edited = st.data_editor(
             df_for_edit,
-            key=f"editor_{cat_key}_volume",
+            key=f"editor_{cat_key}_volume_txt",
             hide_index=True,
             use_container_width=True,
             num_rows="fixed",
             column_config={
                 "id": st.column_config.NumberColumn("ID", disabled=True),
                 "nazwa": st.column_config.TextColumn("nazwa", disabled=True),
+                "Udział objętościowy [%]": st.column_config.TextColumn("Udział objętościowy [%]"),
             },
         )
 
         if edited is not None and not edited.empty:
-            ed = edited.rename(columns={"Udział objętościowy [%]": "udzial_pct"}).copy()
-            ed["udzial_pct"] = ed["udzial_pct"].apply(to_num_val).fillna(0.0)
-            if "id" not in ed.columns:
-                ed["id"] = tbl["id"].values
-            st.session_state[skey] = apply_edited_back(tbl, ed, {"udzial_pct": "udzial_pct"}).reset_index(drop=True)
-        else:
-            st.session_state[skey] = tbl.reset_index(drop=True).copy()
+            ed = edited.reset_index(drop=True).copy()
+            ed = ed.rename(columns={"Udział objętościowy [%]": "udzial_txt"})
+            m = dict(zip(ed["id"].astype(int).tolist(), ed["udzial_txt"].astype(str).tolist()))
+            tbl["udzial_txt"] = tbl["id"].astype(int).map(m).fillna(tbl["udzial_txt"])
+            st.session_state[skey] = tbl.copy()
 
 
 # ============================================================
@@ -603,13 +598,32 @@ with col_left:
 # ============================================================
 with col_right:
     parts_base = []
+
+    # parse total kruszywa
+    kr_total_pct = float(to_num_val(st.session_state.get("kruszywo_total_txt", "0")))
+    if math.isnan(kr_total_pct):
+        kr_total_pct = 0.0
+
     for cat_key, _ in CATEGORIES_ORDERED:
         skey = f"tbl_{cat_key}"
         if skey in st.session_state and isinstance(st.session_state[skey], pd.DataFrame):
             df = ensure_table_columns(st.session_state[skey].copy())
             if df.empty:
                 continue
+
             df["kategoria"] = cat_key
+
+            # WYLICZ udzial_pct z tekstu (LIVE, bez cofek)
+            if cat_key == "kruszywo":
+                shares = df.get("share_in_agg_txt", "").astype(str).apply(to_num_val).fillna(0.0)
+                share_sum = float(shares.sum())
+                if share_sum > 0:
+                    df["udzial_pct"] = (shares / share_sum) * kr_total_pct
+                else:
+                    df["udzial_pct"] = 0.0
+            else:
+                df["udzial_pct"] = df.get("udzial_txt", "").astype(str).apply(to_num_val).fillna(0.0)
+
             df["obj_m3"] = pd.to_numeric(df["udzial_pct"], errors="coerce").fillna(0.0) / 100.0
             df["masa_kg_batch"] = df.apply(
                 lambda r: (float(r["obj_m3"]) * float(r["gestosc_kgm3"])) if pd.notna(r.get("gestosc_kgm3")) else 0.0,
