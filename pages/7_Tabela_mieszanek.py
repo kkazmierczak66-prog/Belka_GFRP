@@ -92,6 +92,38 @@ def strip_apostrophe(s):
     s = str(s)
     return s[1:] if s.startswith("'") else s
 
+# ---------- NOWE: sanitizacja do Google Sheets (usuwa NaN/NA/inf) ----------
+def gs_cell(x):
+    """Zamienia wartości nie-JSON (NaN/NA/inf) na '' i normalizuje typy pod Sheets."""
+    if x is None:
+        return ""
+
+    # pandas/numpy NA/NaN
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+
+    # float nan/inf
+    if isinstance(x, (float, np.floating)):
+        xf = float(x)
+        if math.isnan(xf) or math.isinf(xf):
+            return ""
+        return xf
+
+    # numpy integers
+    if isinstance(x, (np.integer,)):
+        return int(x)
+
+    # pandas Timestamp
+    if isinstance(x, pd.Timestamp):
+        if pd.isna(x):
+            return ""
+        return x.strftime("%d-%m-%Y")
+
+    return x
+
 # ---------- Geometria próbek ----------
 RODZAJE = ["Kostka 10 cm", "Kostka 15 cm", "Cylinder 10 x 20 cm"]
 
@@ -295,7 +327,6 @@ def read_executions_sheet(spreadsheet_id: str, sheet_name: str) -> pd.DataFrame:
     return df[EXEC_HEADER]
 
 @st.cache_data(show_spinner=False)
-@st.cache_data(show_spinner=False)
 def read_tests_sheet(spreadsheet_id: str, sheet_name: str) -> pd.DataFrame:
     ws = _open_or_create_ws(spreadsheet_id, sheet_name, TEST_HEADER)
     rows = ws.get_all_records(numericise_ignore=["all"])
@@ -393,7 +424,7 @@ def save_executions_and_tests_to_sheets():
     ws_exec.clear()
     exec_values = [EXEC_HEADER]
     if exec_rows:
-        exec_values += [[row.get(col, "") for col in EXEC_HEADER] for row in exec_rows]
+        exec_values += [[gs_cell(row.get(col, "")) for col in EXEC_HEADER] for row in exec_rows]
     ws_exec.update("A1", exec_values)
 
     # --- testy ---
@@ -436,7 +467,7 @@ def save_executions_and_tests_to_sheets():
     ws_test.clear()
     test_values = [TEST_HEADER]
     if test_rows:
-        test_values += [[row.get(col, "") for col in TEST_HEADER] for row in test_rows]
+        test_values += [[gs_cell(row.get(col, "")) for col in TEST_HEADER] for row in test_rows]
     ws_test.update("A1", test_values)
 
 def load_exec_state_from_sheet(rname: str, ts_raw: str, exec_ns: str):
@@ -681,7 +712,6 @@ cols_display = [
     "co2e_kg_m3",
     "fck_teoretyczne_col",
 ]
-
 
 edited = st.data_editor(
     display_df[cols_display],
