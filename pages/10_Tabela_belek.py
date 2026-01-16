@@ -216,6 +216,31 @@ def stable_json_test(df: pd.DataFrame) -> str:
     )
 
 
+def _cleanup_tests_for_beam_execs(beam_key: str, kept_exec_nrs: set[int]):
+    """Usuń z session_state testy przypięte do wykonania, które już nie istnieje (żeby nie zapisać 'sierot')."""
+    prefix = f"tests__{beam_key}__"
+    suffixes = ("__df", "__snap", "__editor", "__form")
+    to_delete = []
+    for k in list(st.session_state.keys()):
+        if not isinstance(k, str) or not k.startswith(prefix):
+            continue
+        # k: tests__{beam_key}__{nr}__df
+        parts = k.split("__")
+        # ["tests", beam_key, nr, ...]
+        if len(parts) < 4:
+            continue
+        nr_str = parts[2]
+        try:
+            nr = int(nr_str)
+        except Exception:
+            continue
+        if nr not in kept_exec_nrs and k.endswith(suffixes):
+            to_delete.append(k)
+
+    for k in to_delete:
+        del st.session_state[k]
+
+
 # ============================================================
 # Czytanie arkuszy belek
 # ============================================================
@@ -255,20 +280,26 @@ def read_beam_tests_sheet(spreadsheet_id: str, sheet_name: str) -> pd.DataFrame:
 
 
 # ============================================================
-# Zapis wykonania/testy do Sheets
+# Zapis wykonania/testy do Sheets  --- FIX: MERGE (nie kasuj danych innych belek)
 # ============================================================
 def save_beam_exec_and_tests_to_sheets():
-    # --- wykonania ---
+    # =========================
+    # 1) WYKONANIA (MERGE)
+    # =========================
     exec_rows = []
+    touched_beam_keys_exec: set[str] = set()
+
     for key, value in st.session_state.items():
         if not (isinstance(key, str) and key.startswith("exec__") and key.endswith("__df")):
             continue
         beam_key = key[len("exec__") : -len("__df")]
+        touched_beam_keys_exec.add(str(beam_key))
+
         df_exec = ensure_exec_ids(value)
         for _, r in df_exec.iterrows():
             exec_rows.append(
                 {
-                    "beam_key": beam_key,
+                    "beam_key": str(beam_key),
                     "Nr wyk.": r.get("Nr wyk.", ""),
                     "Data wyk.": r.get("Data wyk.", ""),
                     "Wykonawca/y": r.get("Wykonawca/y", ""),
@@ -276,18 +307,31 @@ def save_beam_exec_and_tests_to_sheets():
                 }
             )
 
+    old_exec = read_beam_exec_sheet(SPREADSHEET_ID, SHEET_BEAM_EXECUTIONS)
+    if old_exec is None or old_exec.empty:
+        old_exec = pd.DataFrame(columns=BEAM_EXEC_HEADER)
+
+    if touched_beam_keys_exec:
+        keep_old_exec = old_exec[~old_exec["beam_key"].astype(str).isin(touched_beam_keys_exec)].copy()
+    else:
+        keep_old_exec = old_exec.copy()
+
+    new_exec_df = (
+        pd.DataFrame(exec_rows, columns=BEAM_EXEC_HEADER) if exec_rows else pd.DataFrame(columns=BEAM_EXEC_HEADER)
+    )
+    merged_exec = pd.concat([keep_old_exec, new_exec_df], ignore_index=True)
+
     ws_exec = _open_or_create_ws(SPREADSHEET_ID, SHEET_BEAM_EXECUTIONS, BEAM_EXEC_HEADER)
     ws_exec.clear()
-    exec_values = (
-        [BEAM_EXEC_HEADER]
-        + [[row.get(col, "") for col in BEAM_EXEC_HEADER] for row in exec_rows]
-        if exec_rows
-        else [BEAM_EXEC_HEADER]
-    )
+    exec_values = [BEAM_EXEC_HEADER] + merged_exec.fillna("").astype(str)[BEAM_EXEC_HEADER].values.tolist()
     ws_exec.update("A1", exec_values)
 
-    # --- testy ---
+    # =========================
+    # 2) TESTY (MERGE)
+    # =========================
     test_rows = []
+    touched_pairs_tests: set[str] = set()  # "beam_key||nr_wyk"
+
     for key, value in st.session_state.items():
         if not (isinstance(key, str) and key.startswith("tests__") and key.endswith("__df")):
             continue
@@ -297,17 +341,20 @@ def save_beam_exec_and_tests_to_sheets():
             beam_key, nr_wyk_str = body.rsplit("__", 1)
         except ValueError:
             continue
+
         try:
             nr_wyk_int = int(nr_wyk_str)
         except Exception:
             nr_wyk_int = None
+
+        touched_pairs_tests.add(f"{str(beam_key)}||{str(nr_wyk_int)}")
 
         df_tests = ensure_test_ids(value)
 
         for _, r in df_tests.iterrows():
             test_rows.append(
                 {
-                    "beam_key": beam_key,
+                    "beam_key": str(beam_key),
                     "Nr wyk.": nr_wyk_int,
                     "Nr testu": r.get("Nr testu", ""),
                     "Data testu": r.get("Data testu", ""),
@@ -323,14 +370,24 @@ def save_beam_exec_and_tests_to_sheets():
                 }
             )
 
+    old_tests = read_beam_tests_sheet(SPREADSHEET_ID, SHEET_BEAM_TESTS)
+    if old_tests is None or old_tests.empty:
+        old_tests = pd.DataFrame(columns=BEAM_TEST_HEADER)
+
+    if touched_pairs_tests:
+        old_pair = old_tests["beam_key"].astype(str) + "||" + old_tests["Nr wyk."].astype(str)
+        keep_old_tests = old_tests[~old_pair.isin(touched_pairs_tests)].copy()
+    else:
+        keep_old_tests = old_tests.copy()
+
+    new_tests_df = (
+        pd.DataFrame(test_rows, columns=BEAM_TEST_HEADER) if test_rows else pd.DataFrame(columns=BEAM_TEST_HEADER)
+    )
+    merged_tests = pd.concat([keep_old_tests, new_tests_df], ignore_index=True)
+
     ws_test = _open_or_create_ws(SPREADSHEET_ID, SHEET_BEAM_TESTS, BEAM_TEST_HEADER)
     ws_test.clear()
-    test_values = (
-        [BEAM_TEST_HEADER]
-        + [[row.get(col, "") for col in BEAM_TEST_HEADER] for row in test_rows]
-        if test_rows
-        else [BEAM_TEST_HEADER]
-    )
+    test_values = [BEAM_TEST_HEADER] + merged_tests.fillna("").astype(str)[BEAM_TEST_HEADER].values.tolist()
     ws_test.update("A1", test_values)
 
 
@@ -641,7 +698,6 @@ beams = beams.sort_values(["__geom_order", "Nazwa"], ascending=[True, True]).res
 # ============================================================
 if "report_coef_map" not in st.session_state:
     st.session_state["report_coef_map"] = {}  # beam_key -> float
-
 coef_map: dict = st.session_state["report_coef_map"]
 
 
@@ -678,18 +734,22 @@ beams["Wynik ost. [USD/kN]"] = (beams["Wynik,min(zbadane) [USD/kN]"] * beams["Ws
 )
 
 # ============================================================
-# Tabela główna (select + edycja Wsp. Raport)
+# Tabela główna (select + edycja Wsp. Raport)  --- FIX: FORM (stabilny fokus checkboxów)
 # ============================================================
 flt = st.text_input("Filtr (zawiera w nazwie belki):", "")
+beams_filtered = beams
 if flt.strip():
-    beams = beams[beams["Nazwa"].astype(str).str.contains(flt.strip(), case=False, na=False)].copy()
+    beams_filtered = beams[beams["Nazwa"].astype(str).str.contains(flt.strip(), case=False, na=False)].copy()
 
-if beams.empty:
+if beams_filtered.empty:
     st.info("Brak belek po filtrze.")
     st.stop()
 
-display_df = beams.copy()
-display_df["__select__"] = False
+if "selected_beam_keys" not in st.session_state:
+    st.session_state["selected_beam_keys"] = set()
+
+display_df = beams_filtered.copy()
+display_df["__select__"] = display_df["__beam_key"].astype(str).isin(set(st.session_state["selected_beam_keys"]))
 
 cols_display = [
     "__select__",
@@ -725,72 +785,88 @@ cols_display = [
 
 disabled_cols = [c for c in cols_display if c not in ["__select__", "Wsp. Raport"]]
 
+with st.form("main_table_form", clear_on_submit=False):
+    edited_main = st.data_editor(
+        display_df[cols_display],
+        key="main_beams_editor",
+        use_container_width=True,
+        hide_index=True,
+        column_order=cols_display,
+        column_config={
+            "__select__": st.column_config.CheckboxColumn("", help="Zaznacz, aby zobaczyć wykonania/testy w expanderze."),
+            "Cena mieszanki [USD/m³]": st.column_config.NumberColumn("Cena mieszanki [USD/m³]", format="%.2f"),
+            "P_ACI_440 [kN]": st.column_config.NumberColumn("P_ACI_440 [kN]", format="%.2f"),
+            "P_JSCE [kN]": st.column_config.NumberColumn("P_JSCE [kN]", format="%.2f"),
+            "P_CSA [kN]": st.column_config.NumberColumn("P_CSA [kN]", format="%.2f"),
+            "Łączna obj. belki [l]": st.column_config.NumberColumn("Łączna obj. belki [l]", format="%.1f"),
+            "Cena mieszanki / belkę [USD]": st.column_config.NumberColumn("Cena mieszanki / belkę [USD]", format="%.2f"),
+            "Łączna ilość prętów": st.column_config.NumberColumn("Łączna ilość prętów", format="%.0f"),
+            "Łączna cena zbrojenia [USD]": st.column_config.NumberColumn("Łączna cena zbrojenia [USD]", format="%.2f"),
+            "Całkowita masa belki [kg]": st.column_config.NumberColumn("Całkowita masa belki [kg]", format="%.2f"),
+            "Koszt materiałów, brutto [USD]": st.column_config.NumberColumn("Koszt materiałów, brutto [USD]", format="%.2f"),
+            "Korekta materiałowa [%]": st.column_config.NumberColumn("Korekta materiałowa [%]", format="%.0f"),
+            "Koszt materiałów, netto [USD]": st.column_config.NumberColumn("Koszt materiałów, netto [USD]", format="%.2f"),
+            "Korekta geometryczna [%]": st.column_config.NumberColumn("Korekta geometryczna [%]", format="%.0f"),
+            "Koszta transportu [USD]": st.column_config.NumberColumn("Koszta transportu [USD]", format="%.2f"),
+            "Cena belki, brutto [USD]": st.column_config.NumberColumn("Cena belki, brutto [USD]", format="%.2f"),
+            "Cena belki, netto [USD]": st.column_config.NumberColumn("Cena belki, netto [USD]", format="%.2f"),
+            "P,min [kN]": st.column_config.NumberColumn("P,min [kN]", format="%.2f"),
+            "P,własne [kN]": st.column_config.NumberColumn("P,własne [kN]", format="%.2f"),
+            "Wynik,min [USD/kN]": st.column_config.NumberColumn("Wynik,min [USD/kN]", format="%.2f"),
+            "Wynik,własne [USD/kN]": st.column_config.NumberColumn("Wynik,własne [USD/kN]", format="%.2f"),
+            "P,min(zbadane) [kN]": st.column_config.NumberColumn("P,min(zbadane) [kN]", format="%.2f"),
+            "Wynik,min(zbadane) [USD/kN]": st.column_config.NumberColumn("Wynik,min(zbadane) [USD/kN]", format="%.2f"),
+            "Wsp. Raport": st.column_config.NumberColumn("Wsp. Raport", help="Wprowadź współczynik raportu", format="%.3f"),
+            "Wynik ost. [USD/kN]": st.column_config.NumberColumn("Wynik ost. [USD/kN]", format="%.2f"),
+        },
+        disabled=disabled_cols,
+    )
 
-edited = st.data_editor(
-    display_df[cols_display],
-    use_container_width=True,
-    hide_index=True,
-    column_order=cols_display,
-    column_config={
-        "__select__": st.column_config.CheckboxColumn("", help="Zaznacz, aby zobaczyć wykonania/testy w expanderze."),
-        "Cena mieszanki [USD/m³]": st.column_config.NumberColumn("Cena mieszanki [USD/m³]", format="%.2f"),
-        "P_ACI_440 [kN]": st.column_config.NumberColumn("P_ACI_440 [kN]", format="%.2f"),
-        "P_JSCE [kN]": st.column_config.NumberColumn("P_JSCE [kN]", format="%.2f"),
-        "P_CSA [kN]": st.column_config.NumberColumn("P_CSA [kN]", format="%.2f"),
-        "Łączna obj. belki [l]": st.column_config.NumberColumn("Łączna obj. belki [l]", format="%.1f"),
-        "Cena mieszanki / belkę [USD]": st.column_config.NumberColumn("Cena mieszanki / belkę [USD]", format="%.2f"),
-        "Łączna ilość prętów": st.column_config.NumberColumn("Łączna ilość prętów", format="%.0f"),
-        "Łączna cena zbrojenia [USD]": st.column_config.NumberColumn("Łączna cena zbrojenia [USD]", format="%.2f"),
-        "Całkowita masa belki [kg]": st.column_config.NumberColumn("Całkowita masa belki [kg]", format="%.2f"),
-        "Koszt materiałów, brutto [USD]": st.column_config.NumberColumn("Koszt materiałów, brutto [USD]", format="%.2f"),
-        "Korekta materiałowa [%]": st.column_config.NumberColumn("Korekta materiałowa [%]", format="%.0f"),
-        "Koszt materiałów, netto [USD]": st.column_config.NumberColumn("Koszt materiałów, netto [USD]", format="%.2f"),
-        "Korekta geometryczna [%]": st.column_config.NumberColumn("Korekta geometryczna [%]", format="%.0f"),
-        "Koszta transportu [USD]": st.column_config.NumberColumn("Koszta transportu [USD]", format="%.2f"),
-        "Cena belki, brutto [USD]": st.column_config.NumberColumn("Cena belki, brutto [USD]", format="%.2f"),
-        "Cena belki, netto [USD]": st.column_config.NumberColumn("Cena belki, netto [USD]", format="%.2f"),
-        "P,min [kN]": st.column_config.NumberColumn("P,min [kN]", format="%.2f"),
-        "P,własne [kN]": st.column_config.NumberColumn("P,własne [kN]", format="%.2f"),
-        "Wynik,min [USD/kN]": st.column_config.NumberColumn("Wynik,min [USD/kN]", format="%.2f"),
-        "Wynik,własne [USD/kN]": st.column_config.NumberColumn("Wynik,własne [USD/kN]", format="%.2f"),
-        "P,min(zbadane) [kN]": st.column_config.NumberColumn("P,min(zbadane) [kN]", format="%.2f"),
-        "Wynik,min(zbadane) [USD/kN]": st.column_config.NumberColumn("Wynik,min(zbadane) [USD/kN]", format="%.2f"),
-        "Wsp. Raport": st.column_config.NumberColumn("Wsp. Raport", help="Wprowadź współczynik raportu", format="%.3f"),
-        "Wynik ost. [USD/kN]": st.column_config.NumberColumn("Wynik ost. [USD/kN]", format="%.2f"),
-    },
-    disabled=disabled_cols,
-)
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        apply_main = st.form_submit_button("✅ Zastosuj wybór / współczynniki")
 
-# --- zapisz edytowane współczynniki do session_state map ---
-try:
-    edited_coef = edited[["Wsp. Raport"]].copy()
-    for idx, val in edited_coef["Wsp. Raport"].items():
-        beam_key = beams.loc[idx, "__beam_key"]
-        v = to_num_pl(val)
-        if pd.isna(v) or v is None or float(v) <= 0:
-            v = 1.0
-        coef_map[str(beam_key)] = float(v)
-    st.session_state["report_coef_map"] = coef_map
-except Exception:
-    pass
+if apply_main:
+    # selection: mapujemy po __beam_key (nie po index)
+    try:
+        selected_keys = set(display_df.loc[edited_main["__select__"] == True, "__beam_key"].astype(str).tolist())
+    except Exception:
+        selected_keys = set()
+    st.session_state["selected_beam_keys"] = selected_keys
 
-selected_idx = edited.index[edited["__select__"] == True] if "__select__" in edited.columns else []
+    # współczynniki: mapujemy po __beam_key
+    try:
+        for i, r in edited_main.iterrows():
+            beam_key = str(display_df.loc[i, "__beam_key"])
+            v = to_num_pl(r.get("Wsp. Raport", 1.0))
+            if pd.isna(v) or v is None or float(v) <= 0:
+                v = 1.0
+            coef_map[beam_key] = float(v)
+        st.session_state["report_coef_map"] = coef_map
+    except Exception:
+        pass
+
+    st.rerun()
+
+selected_keys = set(st.session_state.get("selected_beam_keys", set()))
+selected_rows = display_df[display_df["__beam_key"].astype(str).isin(selected_keys)].copy()
 
 # ============================================================
-# Expandery: wykonania + testy
+# Expandery: wykonania + testy  --- FIX: wszystkie edytory w FORM
 # ============================================================
-if len(selected_idx):
+if len(selected_rows):
     st.subheader("Wykonania i testy")
 
-    for irow in selected_idx:
-        row = beams.loc[irow]
+    for _, row in selected_rows.iterrows():
         beam_key = str(row["__beam_key"])
         name = str(row.get("Nazwa", ""))
         geom = str(row.get("Geometria", ""))
         bid = str(row.get("ID", ""))
 
-        with st.expander(f"[{geom}] ID={bid} • {name}", expanded=False):
-            # --- wykonania ---
+        with st.expander(f"[{geom}] ID={bid} • {name}", expanded=True):
+            # ============================================================
+            # WYKONANIA (FORM -> brak utraty fokusu podczas pisania)
+            # ============================================================
             st.markdown("## Wykonania")
 
             load_exec_state_from_sheet(beam_key)
@@ -800,6 +876,7 @@ if len(selected_idx):
             EXEC_SNAP = f"{exec_ns}__snap"
             EXEC_HIST = f"{exec_ns}__hist"
             EXEC_WKEY = f"{exec_ns}__editor"
+            EXEC_FORM = f"{exec_ns}__form"
 
             exec_df = ensure_exec_ids(st.session_state[EXEC_DF]).copy()
             exec_df["Data wyk."] = (
@@ -807,87 +884,102 @@ if len(selected_idx):
             )
             exec_df["_del"] = False
 
-            edited_exec = st.data_editor(
-                exec_df,
-                key=EXEC_WKEY,
-                use_container_width=True,
-                hide_index=True,
-                num_rows="fixed",
-                column_order=["_del", "Nr wyk.", "Data wyk.", "Wykonawca/y", "Uwagi"],
-                column_config={
-                    "_del": st.column_config.CheckboxColumn("Usuń?", help="Zaznacz wiersze do usunięcia"),
-                    "Nr wyk.": st.column_config.NumberColumn("Nr wyk.", disabled=True),
-                    "Data wyk.": st.column_config.TextColumn("Data wyk. (DD-MM-YYYY)"),
-                    "Wykonawca/y": st.column_config.TextColumn("Wykonawca/y"),
-                    "Uwagi": st.column_config.TextColumn("Uwagi"),
-                },
-            )
+            with st.form(key=EXEC_FORM, clear_on_submit=False):
+                edited_exec = st.data_editor(
+                    exec_df,
+                    key=EXEC_WKEY,
+                    use_container_width=True,
+                    hide_index=True,
+                    num_rows="fixed",
+                    column_order=["_del", "Nr wyk.", "Data wyk.", "Wykonawca/y", "Uwagi"],
+                    column_config={
+                        "_del": st.column_config.CheckboxColumn("Usuń?", help="Zaznacz wiersze do usunięcia"),
+                        "Nr wyk.": st.column_config.NumberColumn("Nr wyk.", disabled=True),
+                        "Data wyk.": st.column_config.TextColumn("Data wyk. (DD-MM-YYYY)"),
+                        "Wykonawca/y": st.column_config.TextColumn("Wykonawca/y"),
+                        "Uwagi": st.column_config.TextColumn("Uwagi"),
+                    },
+                )
 
-            c_add_exec, c_del_exec, _ = st.columns([1, 1, 4])
+                b1, b2, b3 = st.columns([1, 1, 2])
+                with b1:
+                    add_exec_submit = st.form_submit_button("➕ Dodaj wykonanie")
+                with b2:
+                    del_exec_submit = st.form_submit_button("🗑️ Usuń zaznaczone")
+                with b3:
+                    apply_exec_submit = st.form_submit_button("✅ Zastosuj zmiany (wykonania)")
 
-            with c_add_exec:
-                if st.button("➕ Dodaj wykonanie", key=f"{exec_ns}__add"):
-                    hist = st.session_state[EXEC_HIST]
-                    hist.append(st.session_state[EXEC_DF].copy())
-                    if len(hist) > 30:
-                        hist.pop(0)
+            if add_exec_submit or del_exec_submit or apply_exec_submit:
+                df_cur = pd.DataFrame(edited_exec).copy()
 
+                for col_name in ["Data wyk.", "Wykonawca/y", "Uwagi"]:
+                    if col_name in df_cur.columns:
+                        df_cur[col_name] = df_cur[col_name].astype("object").where(pd.notna(df_cur[col_name]), "")
+
+                # historia (opcjonalnie)
+                try:
+                    st.session_state[EXEC_HIST].append(st.session_state[EXEC_DF].copy())
+                    if len(st.session_state[EXEC_HIST]) > 30:
+                        st.session_state[EXEC_HIST].pop(0)
+                except Exception:
+                    pass
+
+                if add_exec_submit:
+                    df_no_del = df_cur.drop(columns=["_del"], errors="ignore")
                     today = pd.Timestamp.now(tz=ZoneInfo("Europe/Warsaw")).date()
                     new_row = {
-                        "Nr wyk.": len(st.session_state[EXEC_DF]) + 1,
+                        "Nr wyk.": None,
                         "Data wyk.": today.strftime("%d-%m-%Y"),
                         "Wykonawca/y": "",
                         "Uwagi": "",
                     }
-                    new_df = pd.concat([st.session_state[EXEC_DF], pd.DataFrame([new_row])], ignore_index=True)
+                    new_df = pd.concat([df_no_del, pd.DataFrame([new_row])], ignore_index=True)
                     new_df = ensure_exec_ids(new_df)
 
                     st.session_state[EXEC_DF] = new_df
                     st.session_state[EXEC_SNAP] = stable_json_exec(new_df)
+
+                    kept = set(int(x) for x in new_df["Nr wyk."].dropna().astype(int).tolist())
+                    _cleanup_tests_for_beam_execs(beam_key, kept)
+
+                    st.toast("Dodano wykonanie.", icon="➕")
                     st.rerun()
 
-            with c_del_exec:
-                if st.button("🗑️ Usuń zaznaczone wykonania", key=f"{exec_ns}__delbtn"):
-                    if "_del" in edited_exec and bool(edited_exec["_del"].any()):
-                        mask_keep = ~edited_exec["_del"].astype(bool)
-                        new_exec = edited_exec.loc[mask_keep].drop(columns=["_del"])
-                        new_exec = ensure_exec_ids(new_exec)
+                if del_exec_submit:
+                    if "_del" in df_cur.columns and bool(df_cur["_del"].astype(bool).any()):
+                        mask_keep = ~df_cur["_del"].astype(bool)
+                        new_df = df_cur.loc[mask_keep].drop(columns=["_del"], errors="ignore")
+                        new_df = ensure_exec_ids(new_df)
 
-                        st.session_state[EXEC_HIST].append(st.session_state[EXEC_DF].copy())
-                        if len(st.session_state[EXEC_HIST]) > 30:
-                            st.session_state[EXEC_HIST].pop(0)
+                        st.session_state[EXEC_DF] = new_df
+                        st.session_state[EXEC_SNAP] = stable_json_exec(new_df)
 
-                        st.session_state[EXEC_DF] = new_exec
-                        st.session_state[EXEC_SNAP] = stable_json_exec(new_exec)
+                        kept = set(int(x) for x in new_df["Nr wyk."].dropna().astype(int).tolist())
+                        _cleanup_tests_for_beam_execs(beam_key, kept)
+
                         st.toast("Usunięto wykonania.", icon="🗑️")
                         st.rerun()
                     else:
                         st.info("Nie zaznaczono żadnych wykonań do usunięcia (użyj kolumny 'Usuń?').")
 
-            # auto-zapis zmian wykonania w session_state
-            edited_no_ui = edited_exec.drop(columns=["_del"], errors="ignore").copy()
-            for col_name in ["Data wyk.", "Wykonawca/y", "Uwagi"]:
-                if col_name in edited_no_ui.columns:
-                    edited_no_ui[col_name] = edited_no_ui[col_name].astype("object").where(
-                        pd.notna(edited_no_ui[col_name]), ""
-                    )
-            edited_no_ui = ensure_exec_ids(edited_no_ui)
+                if apply_exec_submit:
+                    new_df = df_cur.drop(columns=["_del"], errors="ignore")
+                    new_df = ensure_exec_ids(new_df)
 
-            cur_snap = stable_json_exec(edited_no_ui)
-            if cur_snap != st.session_state.get(EXEC_SNAP, ""):
-                st.session_state[EXEC_HIST].append(st.session_state[EXEC_DF].copy())
-                if len(st.session_state[EXEC_HIST]) > 30:
-                    st.session_state[EXEC_HIST].pop(0)
-                st.session_state[EXEC_DF] = edited_no_ui.copy()
-                st.session_state[EXEC_SNAP] = cur_snap
-                st.toast("Zapisano zmiany w wykonaniach (lokalnie).", icon="✅")
-                st.rerun()
+                    st.session_state[EXEC_DF] = new_df
+                    st.session_state[EXEC_SNAP] = stable_json_exec(new_df)
+
+                    kept = set(int(x) for x in new_df["Nr wyk."].dropna().astype(int).tolist())
+                    _cleanup_tests_for_beam_execs(beam_key, kept)
+
+                    st.toast("Zastosowano zmiany (wykonania).", icon="✅")
+                    st.rerun()
 
             current_exec_df = ensure_exec_ids(st.session_state[EXEC_DF]).reset_index(drop=True)
 
-            # --- testy per wykonanie ---
-
-
+            # ============================================================
+            # TESTY (FORM -> brak utraty fokusu podczas pisania)
+            # ============================================================
             for idx_exec, erow in current_exec_df.iterrows():
                 nr_wyk = erow.get("Nr wyk.", idx_exec + 1)
                 try:
@@ -905,11 +997,10 @@ if len(selected_idx):
                 TDF = f"{tests_ns}__df"
                 TSNAP = f"{tests_ns}__snap"
                 TWKEY = f"{tests_ns}__editor"
+                TFORM = f"{tests_ns}__form"
 
                 # ----- Dane do ZAPISU (bez kolumny USD/kN) -----
                 tests_df = ensure_test_ids(st.session_state[TDF].copy())
-
-                # licz wiek (zapisujemy)
                 tests_df["Wiek w trakcie badania [dni]"] = tests_df["Data testu"].apply(
                     lambda d: compute_age_days(exec_date_str, d)
                 )
@@ -921,56 +1012,80 @@ if len(selected_idx):
                 tests_view[TEST_USD_COL] = (beam_price_netto / p_test.where(p_test > 0)).replace(
                     [math.inf, -math.inf], pd.NA
                 )
-
                 tests_view["_del"] = False
 
-                edited_tests = st.data_editor(
-                    tests_view,
-                    key=TWKEY,
-                    num_rows="fixed",
-                    use_container_width=True,
-                    hide_index=True,
-                    column_order=[
-                        "_del",
-                        "Nr testu",
+                with st.form(key=TFORM, clear_on_submit=False):
+                    edited_tests = st.data_editor(
+                        tests_view,
+                        key=TWKEY,
+                        num_rows="fixed",
+                        use_container_width=True,
+                        hide_index=True,
+                        column_order=[
+                            "_del",
+                            "Nr testu",
+                            "Data testu",
+                            "Wiek w trakcie badania [dni]",
+                            "Wynik",
+                            "Masa [kg]",
+                            "Długość [cm]",
+                            "Szerokość [cm]",
+                            "Wysokość [cm]",
+                            "Otulina [cm]",
+                            TEST_USD_COL,
+                            "Wykonawca/y",
+                            "Uwagi",
+                        ],
+                        column_config={
+                            "_del": st.column_config.CheckboxColumn("Usuń?", help="Zaznacz testy do usunięcia"),
+                            "Nr testu": st.column_config.NumberColumn("Nr testu", disabled=True),
+                            "Data testu": st.column_config.TextColumn("Data testu (DD-MM-YYYY)"),
+                            "Wiek w trakcie badania [dni]": st.column_config.NumberColumn(
+                                "Wiek w trakcie badania [dni]", disabled=True, format="%.0f"
+                            ),
+                            "Wynik": st.column_config.TextColumn("Wynik [kN]"),
+                            "Masa [kg]": st.column_config.TextColumn("Masa [kg]"),
+                            "Długość [cm]": st.column_config.TextColumn("Długość [cm]"),
+                            "Szerokość [cm]": st.column_config.TextColumn("Szerokość [cm]"),
+                            "Wysokość [cm]": st.column_config.TextColumn("Wysokość [cm]"),
+                            "Otulina [cm]": st.column_config.TextColumn("Otulina [cm]"),
+                            TEST_USD_COL: st.column_config.NumberColumn(TEST_USD_COL, disabled=True, format="%.2f"),
+                            "Wykonawca/y": st.column_config.TextColumn("Wykonawca/y"),
+                            "Uwagi": st.column_config.TextColumn("Uwagi"),
+                        },
+                    )
+
+                    tb1, tb2, tb3 = st.columns([1, 1, 2])
+                    with tb1:
+                        add_test_submit = st.form_submit_button("➕ Dodaj test")
+                    with tb2:
+                        del_test_submit = st.form_submit_button("🗑️ Usuń zaznaczone")
+                    with tb3:
+                        apply_test_submit = st.form_submit_button("✅ Zastosuj zmiany (testy)")
+
+                if add_test_submit or del_test_submit or apply_test_submit:
+                    df_cur = pd.DataFrame(edited_tests).copy()
+
+                    # usuń UI-only kolumny
+                    df_cur = df_cur.drop(columns=[TEST_USD_COL], errors="ignore")
+
+                    # normalizacja pustych (stringi)
+                    for col_name in [
                         "Data testu",
-                        "Wiek w trakcie badania [dni]",
                         "Wynik",
                         "Masa [kg]",
                         "Długość [cm]",
                         "Szerokość [cm]",
                         "Wysokość [cm]",
                         "Otulina [cm]",
-                        TEST_USD_COL,  # <- readonly, nie zapisujemy
                         "Wykonawca/y",
                         "Uwagi",
-                    ],
-                    column_config={
-                        "_del": st.column_config.CheckboxColumn("Usuń?", help="Zaznacz testy do usunięcia"),
-                        "Nr testu": st.column_config.NumberColumn("Nr testu", disabled=True),
-                        "Data testu": st.column_config.TextColumn("Data testu (DD-MM-YYYY)"),
-                        "Wiek w trakcie badania [dni]": st.column_config.NumberColumn(
-                            "Wiek w trakcie badania [dni]", disabled=True, format="%.0f"
-                        ),
-                        "Wynik": st.column_config.TextColumn("Wynik [kN]"),
-                        "Masa [kg]": st.column_config.TextColumn("Masa [kg]"),
-                        "Długość [cm]": st.column_config.TextColumn("Długość [cm]"),
-                        "Szerokość [cm]": st.column_config.TextColumn("Szerokość [cm]"),
-                        "Wysokość [cm]": st.column_config.TextColumn("Wysokość [cm]"),
-                        "Otulina [cm]": st.column_config.TextColumn("Otulina [cm]"),
-                        TEST_USD_COL: st.column_config.NumberColumn(
-                            TEST_USD_COL, disabled=True, format="%.2f"
-                        ),
-                        "Wykonawca/y": st.column_config.TextColumn("Wykonawca/y"),
-                        "Uwagi": st.column_config.TextColumn("Uwagi"),
-                    },
-                )
+                    ]:
+                        if col_name in df_cur.columns:
+                            df_cur[col_name] = df_cur[col_name].astype("object").where(pd.notna(df_cur[col_name]), "")
 
-                c_add_test, c_del_test, _ = st.columns([1, 1, 4])
-
-                with c_add_test:
-                    if st.button("➕ Dodaj test", key=f"{tests_ns}__add"):
-                        cur_tests = st.session_state[TDF]
+                    if add_test_submit:
+                        df_no_del = df_cur.drop(columns=["_del"], errors="ignore")
                         new_row_t = {
                             "Nr testu": None,
                             "Data testu": "",
@@ -984,64 +1099,40 @@ if len(selected_idx):
                             "Wykonawca/y": "",
                             "Uwagi": "",
                         }
-                        new_tests_df = pd.concat([cur_tests, pd.DataFrame([new_row_t])], ignore_index=True)
-                        new_tests_df = ensure_test_ids(new_tests_df)
-                        new_tests_df["Wiek w trakcie badania [dni]"] = new_tests_df["Data testu"].apply(
+                        new_df = pd.concat([df_no_del, pd.DataFrame([new_row_t])], ignore_index=True)
+                        new_df = ensure_test_ids(new_df)
+                        new_df["Wiek w trakcie badania [dni]"] = new_df["Data testu"].apply(
                             lambda d: compute_age_days(exec_date_str, d)
                         )
-                        st.session_state[TDF] = new_tests_df
-                        st.session_state[TSNAP] = stable_json_test(new_tests_df)
+                        st.session_state[TDF] = new_df
+                        st.session_state[TSNAP] = stable_json_test(new_df)
+                        st.toast("Dodano test.", icon="➕")
                         st.rerun()
 
-                with c_del_test:
-                    if st.button("🗑️ Usuń zaznaczone testy", key=f"{tests_ns}__del"):
-                        if "_del" in edited_tests and bool(edited_tests["_del"].any()):
-                            mask_keep_t = ~edited_tests["_del"].astype(bool)
-
-                            # usuń też kolumnę obliczeniową (nie zapisujemy)
-                            new_tests = edited_tests.loc[mask_keep_t].drop(columns=["_del", TEST_USD_COL], errors="ignore")
-                            new_tests = ensure_test_ids(new_tests)
-
-                            new_tests["Wiek w trakcie badania [dni]"] = new_tests["Data testu"].apply(
+                    if del_test_submit:
+                        if "_del" in df_cur.columns and bool(df_cur["_del"].astype(bool).any()):
+                            mask_keep = ~df_cur["_del"].astype(bool)
+                            new_df = df_cur.loc[mask_keep].drop(columns=["_del"], errors="ignore")
+                            new_df = ensure_test_ids(new_df)
+                            new_df["Wiek w trakcie badania [dni]"] = new_df["Data testu"].apply(
                                 lambda d: compute_age_days(exec_date_str, d)
                             )
-
-                            st.session_state[TDF] = new_tests.copy()
-                            st.session_state[TSNAP] = stable_json_test(new_tests)
+                            st.session_state[TDF] = new_df
+                            st.session_state[TSNAP] = stable_json_test(new_df)
                             st.toast("Usunięto testy.", icon="🗑️")
                             st.rerun()
                         else:
                             st.info("Nie zaznaczono żadnych testów do usunięcia (użyj kolumny 'Usuń?').")
 
-                # auto-zapis zmian testów w session_state
-                edited_tests_no_ui = edited_tests.drop(columns=["_del", TEST_USD_COL], errors="ignore").copy()
-
-                for col_name in [
-                    "Data testu",
-                    "Wynik",
-                    "Masa [kg]",
-                    "Długość [cm]",
-                    "Szerokość [cm]",
-                    "Wysokość [cm]",
-                    "Otulina [cm]",
-                    "Wykonawca/y",
-                    "Uwagi",
-                ]:
-                    if col_name in edited_tests_no_ui.columns:
-                        edited_tests_no_ui[col_name] = edited_tests_no_ui[col_name].astype("object").where(
-                            pd.notna(edited_tests_no_ui[col_name]), ""
+                    if apply_test_submit:
+                        new_df = df_cur.drop(columns=["_del"], errors="ignore")
+                        new_df = ensure_test_ids(new_df)
+                        new_df["Wiek w trakcie badania [dni]"] = new_df["Data testu"].apply(
+                            lambda d: compute_age_days(exec_date_str, d)
                         )
-
-                edited_tests_no_ui = ensure_test_ids(edited_tests_no_ui)
-
-                # zawsze przelicz wiek przed zapisaniem (żeby poszedł do Sheets)
-                edited_tests_no_ui["Wiek w trakcie badania [dni]"] = edited_tests_no_ui["Data testu"].apply(
-                    lambda d: compute_age_days(exec_date_str, d)
-                )
-
-                cur_t_snap = stable_json_test(edited_tests_no_ui)
-                if cur_t_snap != st.session_state.get(TSNAP, ""):
-                    st.session_state[TDF] = edited_tests_no_ui.copy()
-                    st.session_state[TSNAP] = cur_t_snap
-                    st.toast("Zapisano zmiany w testach (lokalnie).", icon="✅")
-                    st.rerun()
+                        st.session_state[TDF] = new_df
+                        st.session_state[TSNAP] = stable_json_test(new_df)
+                        st.toast("Zastosowano zmiany (testy).", icon="✅")
+                        st.rerun()
+else:
+    st.info("Zaznacz belki (checkbox w tabeli), a potem kliknij „Zastosuj…”, aby zobaczyć wykonania i testy.")
