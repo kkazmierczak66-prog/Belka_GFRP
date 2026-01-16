@@ -691,6 +691,23 @@ for c in num_candidates:
     if c in beams.columns:
         beams[c] = beams[c].apply(to_num_pl)
 
+# ============================================================
+# (FIX) Wylicz Cena mieszanki [USD/m³] z: Cena / belkę i objętości [l], gdy brak/0/NaN
+# ============================================================
+if "Cena mieszanki [USD/m³]" not in beams.columns:
+    beams["Cena mieszanki [USD/m³]"] = pd.NA
+
+vol_l = beams.get("Łączna obj. belki [l]", pd.Series([pd.NA] * len(beams))).apply(to_num_pl)
+cost_per_beam = beams.get("Cena mieszanki / belkę [USD]", pd.Series([pd.NA] * len(beams))).apply(to_num_pl)
+
+vol_m3 = (vol_l / 1000.0).where(vol_l > 0)
+
+computed_price_m3 = (cost_per_beam / vol_m3).replace([math.inf, -math.inf], pd.NA)
+
+existing = beams["Cena mieszanki [USD/m³]"].apply(to_num_pl)
+# Nadpisz tylko tam, gdzie istniejąca jest pusta / <=0, a da się policzyć
+beams["Cena mieszanki [USD/m³]"] = existing.where(existing.notna() & (existing > 0), computed_price_m3)
+
 beams = beams.sort_values(["__geom_order", "Nazwa"], ascending=[True, True]).reset_index(drop=True)
 
 # ============================================================

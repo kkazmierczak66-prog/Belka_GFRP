@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import math
 import plotly.graph_objects as go
+
 # ==========================
 # Google Sheets – receptury (BEZ ZMIAN)
 # ==========================
@@ -146,10 +147,8 @@ with refresh_col:
         use_container_width=True,
         help="Wymusza ponowne pobranie danych z Google Sheets i przeliczenie widoku",
     ):
-        # 1) czyścimy cache streamlit
         st.cache_data.clear()
 
-        # 2) czyścimy to co najczęściej blokuje odświeżanie (dopasuj listę do Twojego pliku)
         for k in [
             "df_beams_i",
             "df_beams_tpd",
@@ -162,7 +161,6 @@ with refresh_col:
             if k in st.session_state:
                 del st.session_state[k]
 
-        # 3) dodatkowo: usuń wszystkie expanderowe stany wykonania/testów (jeśli używasz exec__/tests__)
         for k in list(st.session_state.keys()):
             if isinstance(k, str) and (k.startswith("exec__") or k.startswith("tests__")):
                 del st.session_state[k]
@@ -239,22 +237,41 @@ LOAD_KEYS = [
     "beam_name_to_save", "chk_overwrite_beam",
 ]
 
+# ✅ helper do domyślnych wartości z payloadu
+def d(key: str, default):
+    return st.session_state.get(f"__d__{key}", default)
+
+
 def _apply_load_payload_if_needed():
     """
     Jeśli istnieje payload ładowania, to:
-    1) kasujemy klucze widgetów (żeby mogły przyjąć nowe defaulty),
-    2) zapisujemy defaulty pod __d__{key}.
+    1) kasujemy klucze widgetów (żeby Streamlit nie trzymał starych wartości),
+    2) ustawiamy BOTH:
+       - __d__{key} (dla Twojej logiki defaultów)
+       - {key} w session_state (żeby WIDGETY faktycznie przyjęły wartości)
     """
     payload = st.session_state.pop("__load_payload_i__", None)
     if not payload:
         return
 
+    # 1) usuń stan widgetów (żeby mogły przyjąć nowe wartości)
     for k in LOAD_KEYS:
         if k in st.session_state:
             del st.session_state[k]
 
+    # 2) ustaw domyślne + faktyczne wartości widgetów
     for k, v in payload.items():
+        # zostawiamy "specjalne" klucze tylko w __d__ (np. __gfrp_bar_id__)
         st.session_state[f"__d__{k}"] = v
+
+        # TYLKO dla normalnych kluczy widgetów ustawiamy stan widgetu
+        if isinstance(k, str) and not k.startswith("__"):
+            st.session_state[k] = v
+
+    # 3) sekcja zapisu — ma się od razu pokazać nazwa w input
+    st.session_state["beam_name_to_save"] = payload.get("beam_name_to_save", "")
+    st.session_state["chk_overwrite_beam"] = bool(payload.get("chk_overwrite_beam", False))
+
 
 
 def _request_widget_reset(widget_key: str, placeholder_value: str):
@@ -271,7 +288,6 @@ def _build_payload_from_row(row: dict) -> dict:
     """
     Mapowanie nagłówków INPUT_* -> klucze widgetów w Twoim kodzie.
     """
-    # beton_mode w arkuszu: "gsheet"/"manual" -> radio label
     mode_raw = str(row.get("INPUT_beton_mode", "")).strip().lower()
     if mode_raw in ("gsheet", "google", "baza", "db"):
         beton_mode_label = "Wybór z bazy danych"
@@ -323,7 +339,7 @@ def _build_payload_from_row(row: dict) -> dict:
         "chk_overwrite_beam": True,
     }
 
-    # pręt GFRP: w arkuszu jest ID, a w selectbox masz index df_gfrp -> rozwiążemy to później indexem
+    # pręt GFRP: w arkuszu jest ID, a w selectbox masz index df_gfrp -> rozwiązanie indexem niżej
     payload["__gfrp_bar_id__"] = _to_int(row.get("INPUT_gfrp_bar_id"), None)
 
     return payload
@@ -342,7 +358,6 @@ def load_beam_i_ui():
         st.info(f"Arkusz „{SHEET_BEAMS_I}” jest pusty.")
         return
 
-    # sort po ID jeśli jest
     if "ID" in df.columns:
         df["_ID_num"] = pd.to_numeric(df["ID"], errors="coerce")
         df = df.sort_values("_ID_num", ascending=True)
@@ -376,17 +391,17 @@ def load_beam_i_ui():
 
         payload = _build_payload_from_row(row)
 
-        # wrzucamy payload do session_state i robimy rerun — a na górze strony payload zostanie zastosowany
         st.session_state["__load_payload_i__"] = payload
-
-        # reset selectboxa po wczytaniu (bez APIException)
         _request_widget_reset(key_sel, placeholder)
 
         st.success(f"Wczytano belkę: {row.get('Nazwa belki','')}")
         st.rerun()
 
+
 _apply_load_payload_if_needed()
 load_beam_i_ui()
+
+st.markdown("---")
 # ============================================================
 # SEKCJA – DANE DOTYCZĄCE BETONU (BEZ ZMIAN)
 # ============================================================
@@ -524,8 +539,6 @@ except Exception:
 
 st.header("Parametry belki")
 
-
-
 col_g1, col_g2, col_g3 = st.columns(3)
 with col_g1:
     L_beam = st.number_input(
@@ -584,21 +597,15 @@ A_min = masa_min / (rho * L_beam) if rho > 0 and L_beam > 0 else 0.0
 A_max = masa_max / (rho * L_beam) if rho > 0 and L_beam > 0 else 0.0
 
 A = b_m * h_m
-
-# środek ciężkości od dołu przekroju (prostokąt)
 y_c = h_m / 2.0 if A > 0 else 0.0
-
-# moment bezwładności względem osi poziomej przechodzącej przez środek (Ix)
 I = (b_m * h_m**3) / 12.0 if A > 0 else 0.0
 I_do_A = (I / A) if A > 0 else 0.0
 
-# jednostki do prezentacji
 A_cm2, A_min_cm2, A_max_cm2 = A * 1e4, A_min * 1e4, A_max * 1e4
 I_cm4, I_do_A_cm2, y_c_cm = I * 1e8, I_do_A * 1e4, y_c * 100.0
 
 masa_belki = rho * A * L_beam  # kg
 
-# WALIDACJA
 if A > 0 and A_min <= A <= A_max and A_min < A_max:
     status_text, status_color = "✅ Pole przekroju mieści się w zakresie z masy.", "lime"
 elif A == 0:
@@ -631,21 +638,17 @@ with col_l:
             st.markdown("<span style='color:red; font-weight:700'>❌ Masa belki poza zadanym zakresem.</span>", unsafe_allow_html=True)
 
 with col_r:
-    # ---------------------------
-    # RYSUNEK PRZEKROJU (PROSTOKĄT) — Plotly (wersja finalna z y_c "za" wymiarem h)
-    # ---------------------------
     import plotly.graph_objects as go
 
     b_cm = float(b_rect)
     h_cm = float(h_rect)
-    y_c_cm = float(y_c_cm)  # policzone wcześniej
+    y_c_cm = float(y_c_cm)
 
-    # Auto-skala + padding
     pad_x = max(1.0, 0.15 * b_cm)
-    pad_y = max(1.0, 0.20 * h_cm)  # większy zapas na opis b pod wymiarem
+    pad_y = max(1.0, 0.20 * h_cm)
 
     x_min, x_max = -b_cm / 2.0 - pad_x, b_cm / 2.0 + pad_x
-    y_min, y_max = -pad_y, h_cm + pad_y  # większy margines w dół
+    y_min, y_max = -pad_y, h_cm + pad_y
 
     fig = go.Figure()
     fig.update_layout(
@@ -654,11 +657,10 @@ with col_r:
         font=dict(color="white"),
         width=None,
         height=650,
-        margin=dict(l=10, r=160, t=40, b=10),  # ✅ większy prawy margines na opisy
+        margin=dict(l=10, r=160, t=40, b=10),
         showlegend=False,
     )
 
-    # prostokąt przekroju (oś x w środku)
     if b_cm > 0 and h_cm > 0:
         fig.add_shape(
             type="rect",
@@ -670,7 +672,6 @@ with col_r:
             fillcolor="rgba(100,160,255,0.6)",
         )
 
-    # środek ciężkości y_c — TYLKO linia + opis (bez kropki)
     if b_cm > 0 and h_cm > 0:
         fig.add_shape(
             type="line",
@@ -681,9 +682,8 @@ with col_r:
             line=dict(color="red", width=2, dash="dash"),
         )
 
-        # ✅ opis "za" wymiarem h (xref="paper" pozwala wyjść poza wykres)
         fig.add_annotation(
-            x=0.65,  # >1.0 = bardziej w prawo (poza obszarem osi)
+            x=0.65,
             xref="paper",
             y=y_c_cm,
             yref="y",
@@ -694,28 +694,22 @@ with col_r:
             align="left",
         )
 
-
-    # pomocnicze funkcje: linie wymiarowe z tickami
     def add_dim_h(fig, x0, x1, y, tick=0.6, w=2):
         fig.add_shape(type="line", x0=x0, y0=y, x1=x1, y1=y, line=dict(color="white", width=w))
         fig.add_shape(type="line", x0=x0, y0=y - tick, x1=x0, y1=y + tick, line=dict(color="white", width=w))
         fig.add_shape(type="line", x0=x1, y0=y - tick, x1=x1, y1=y + tick, line=dict(color="white", width=w))
-
 
     def add_dim_v(fig, x, y0, y1, tick=0.6, w=2):
         fig.add_shape(type="line", x0=x, y0=y0, x1=x, y1=y1, line=dict(color="white", width=w))
         fig.add_shape(type="line", x0=x - tick, y0=y0, x1=x + tick, y1=y0, line=dict(color="white", width=w))
         fig.add_shape(type="line", x0=x - tick, y0=y1, x1=x + tick, y1=y1, line=dict(color="white", width=w))
 
-
     tick_h = max(0.4, 0.03 * b_cm)
     tick_v = max(0.4, 0.03 * h_cm)
 
-    # wymiar b (na dole)
     y_dim_b = y_min + 0.8
     add_dim_h(fig, -b_cm / 2.0, b_cm / 2.0, y_dim_b, tick=tick_v)
 
-    # opis b — na linii wymiarowej + przesunięcie w dół w pikselach (żeby nie "ginął")
     fig.add_annotation(
         x=0,
         y=y_dim_b,
@@ -727,7 +721,6 @@ with col_r:
         yshift=-16,
     )
 
-    # wymiar h (po prawej)
     x_dim_h = x_max - 0.5
     add_dim_v(fig, x_dim_h, 0, h_cm, tick=tick_h)
     fig.add_annotation(
@@ -739,7 +732,6 @@ with col_r:
         font=dict(color="white"),
     )
 
-    # osie i proporcje (1:1)
     fig.update_xaxes(
         range=[x_min, x_max],
         title="Szerokość [cm], oś x (0 w środku przekroju)",
@@ -756,9 +748,6 @@ with col_r:
     )
 
     st.plotly_chart(fig, use_container_width=True)
-
-
-
 
 
 # ==========================
@@ -799,7 +788,6 @@ def read_gfrp_bars(spreadsheet_id: str, sheet_name: str) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = None
 
-    # liczby
     for c in ["id", "srednica_mm", "R_t_MPa", "E_GPa", "τ_base_MPa", "gestosc_gcm3", "cena_pln", "co2e_kgkg"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -807,22 +795,16 @@ def read_gfrp_bars(spreadsheet_id: str, sheet_name: str) -> pd.DataFrame:
     df["cena_za"] = df["cena_za"].astype(object)
 
     return df[wanted]
+
+
 # ============================================================
 # SEKCJA ZBROJENIE — prostokąt
-#  - wybór pręta z bazy GFRP: TAK SAMO
-#  - rozmieszczenie 1: "Zbrojenie dolne" (dół przekroju)
-#  - rozmieszczenie 2: "Zbrojenie górne" (góra przekroju)
 # ============================================================
-
 import plotly.graph_objects as go
 
 st.markdown("---")
 st.header("Zbrojenie")
 
-# --- Arkusz z prętami GFRP ---
-SHEET_GFRP = st.secrets.get("SHEET_GFRP", "gfrp_bars")
-
-# === 1) Wybór pręta z bazy GFRP (bez zmian) ===
 df_gfrp = None
 
 if GS_RECIPES_READY:
@@ -859,21 +841,18 @@ def format_bar(i: int) -> str:
     if prof:
         parts.append(prof)
     return " – ".join(parts) if parts else str(i)
+
 # --- domyślny wybór pręta po ID z arkusza (jeśli załadowano belkę) ---
 default_sel_index = 0
-payload = st.session_state.get("__load_payload_i__", None)  # już zwykle None po zastosowaniu, więc bierzemy __d__
-desired_bar_id = st.session_state.get("__d____gfrp_bar_id__", None)  # uwaga: klucz jest specjalny
-
-if desired_bar_id is None:
-    # payload zapisaliśmy jako "__gfrp_bar_id__" -> po apply trafił do "__d____gfrp_bar_id__"
-    desired_bar_id = st.session_state.get("__d____gfrp_bar_id__", None)
+desired_bar_id = st.session_state.get("__d____gfrp_bar_id__", None)
 
 if desired_bar_id is not None and "id" in df_gfrp.columns:
     m = df_gfrp[df_gfrp["id"] == desired_bar_id]
     if not m.empty:
-        opt_val = m.index[0]          # to jest wartość wybierana w selectbox (index df)
+        opt_val = m.index[0]
         if opt_val in options_idx:
             default_sel_index = options_idx.index(opt_val)
+
 sel_idx = st.selectbox(
     "Pręt z bazy danych:",
     options_idx,
@@ -884,7 +863,6 @@ sel_idx = st.selectbox(
 
 row = df_gfrp.loc[sel_idx]
 
-# ŚREDNICA tylko z bazy (wymagana)
 phi_mm = None
 if pd.notna(row.get("srednica_mm")):
     try:
@@ -923,46 +901,45 @@ st.markdown(
 """
 )
 
-# W prostokącie: ta sama średnica dla dolnego i górnego zbrojenia
 phi_bot_mm = phi_mm
 phi_top_mm = phi_mm
 
-# Geometria przekroju w mm (prostokąt)
 b_rect_mm = float(b_rect) * 10.0
 h_rect_mm = float(h_rect) * 10.0
 
 # ============================================================
-# 2) ZBROJENIE DOLNE (dół przekroju) — dawniej "półka"
+# 2) ZBROJENIE DOLNE (dół przekroju)
 # ============================================================
 st.subheader("Rozmieszczenie prętów — zbrojenie dolne")
 
 col_left, col_right = st.columns([1, 1])
 
+# ✅ POPRAWKA: value bierze z __d__ (czyli z wczytanej belki)
 with col_left:
     col1, col2, col3 = st.columns(3)
     with col1:
-        otulina_dolna = st.number_input("Otulina dolna [mm]", value=5.0, key="z_ot_dolna")
+        otulina_dolna = st.number_input("Otulina dolna [mm]", value=float(d("z_ot_dolna", 5.0)), key="z_ot_dolna")
     with col2:
-        otulina_gorna = st.number_input("Otulina górna [mm]", value=5.0, key="z_ot_gorna")
+        otulina_gorna = st.number_input("Otulina górna [mm]", value=float(d("z_ot_gorna", 5.0)), key="z_ot_gorna")
     with col3:
-        otulina_boczna = st.number_input("Otulina boczna [mm]", value=5.0, key="z_ot_boczna")
+        otulina_boczna = st.number_input("Otulina boczna [mm]", value=float(d("z_ot_boczna", 5.0)), key="z_ot_boczna")
 
     col4, col5 = st.columns(2)
     with col4:
         odleglosc_pozioma = st.number_input(
             "Odstęp poziomy między prętami [mm] (clear)",
-            value=5.0,
+            value=float(d("z_odst_poziomy", 5.0)),
             key="z_odst_poziomy",
         )
     with col5:
         odleglosc_pionowa = st.number_input(
             "Odstęp pionowy między warstwami [mm] (clear)",
-            value=5.0,
+            value=float(d("z_odst_pionowy", 5.0)),
             key="z_odst_pionowy",
         )
 
-    n_wlasne = int(st.number_input("Liczba prętów w 1 warstwie [szt.]", min_value=0, value=4, key="z_n_wlasne"))
-    warstwy_wlasne = int(st.number_input("Liczba warstw [szt.]", min_value=0, value=1, key="z_warstwy_wlasne"))
+    n_wlasne = int(st.number_input("Liczba prętów w 1 warstwie [szt.]", min_value=0, value=int(d("z_n_wlasne", 4)), step=1, key="z_n_wlasne"))
+    warstwy_wlasne = int(st.number_input("Liczba warstw [szt.]", min_value=0, value=int(d("z_warstwy_wlasne", 1)), step=1, key="z_warstwy_wlasne"))
 
     szer_dostepna = b_rect_mm - 2 * otulina_boczna
     wysokosc_dostepna = h_rect_mm - otulina_dolna - otulina_gorna
@@ -993,7 +970,6 @@ with col_left:
     for v in violations:
         st.error(v)
 
-    # As + obwód
     A_pręt = math.pi * (phi_bot_mm / 2.0) ** 2 / 100.0  # cm²
     As_bot = A_pręt * n_wlasne * warstwy_wlasne
     O_bot = math.pi * phi_bot_mm * n_wlasne * warstwy_wlasne
@@ -1017,7 +993,6 @@ with col_right:
         margin=dict(l=10, r=10, t=10, b=10),
     )
 
-    # prostokąt przekroju
     fig_bot.add_shape(
         type="rect",
         x0=0,
@@ -1034,7 +1009,6 @@ with col_right:
     if fits_bot:
         fi = phi_bot_mm
 
-        # poziom: rozkład po szerokości
         szer_dostepna_vis = max(0.0, b_rect_mm - 2 * otulina_boczna)
         if n_wlasne == 1:
             x_poz = [b_rect_mm / 2.0]
@@ -1042,7 +1016,6 @@ with col_right:
             x0 = otulina_boczna + fi / 2.0
             x_poz = [x0 + i * (szer_dostepna_vis - fi) / (n_wlasne - 1) for i in range(n_wlasne)]
 
-        # pion: warstwy od dołu do góry
         y0 = otulina_dolna + fi / 2.0
         krok = fi + odleglosc_pionowa
         y_poz = [y0 + j * krok for j in range(warstwy_wlasne)]
@@ -1070,37 +1043,30 @@ with col_right:
     st.plotly_chart(fig_bot, use_container_width=True)
 
 # ============================================================
-# 3) ZBROJENIE GÓRNE (góra przekroju) — dawniej "środnik"
+# 3) ZBROJENIE GÓRNE (góra przekroju)
 # ============================================================
 st.subheader("Rozmieszczenie prętów — zbrojenie górne")
 
 col_ws_left, col_ws_right = st.columns([1, 1])
 
+# ✅ POPRAWKA: value bierze z __d__ (czyli z wczytanej belki)
 with col_ws_left:
     colw1, colw2, colw3 = st.columns(3)
     with colw1:
-        otulina_gorna_s = st.number_input("Otulina górna [mm] (od góry przekroju)", value=5.0, key="s_ot_gorna")
+        otulina_gorna_s = st.number_input("Otulina górna [mm] (od góry przekroju)", value=float(d("s_ot_gorna", 5.0)), key="s_ot_gorna")
     with colw2:
-        otulina_dolna_s = st.number_input("Otulina dolna [mm] (od dołu przekroju)", value=5.0, key="s_ot_dolna")
+        otulina_dolna_s = st.number_input("Otulina dolna [mm] (od dołu przekroju)", value=float(d("s_ot_dolna", 5.0)), key="s_ot_dolna")
     with colw3:
-        otulina_boczna_s = st.number_input("Otulina boczna [mm]", value=5.0, key="s_ot_boczna")
+        otulina_boczna_s = st.number_input("Otulina boczna [mm]", value=float(d("s_ot_boczna", 5.0)), key="s_ot_boczna")
 
     colw4, colw5 = st.columns(2)
     with colw4:
-        odleglosc_pozioma_s = st.number_input(
-            "Odstęp poziomy między prętami [mm] (clear)",
-            value=5.0,
-            key="s_odst_poziomy",
-        )
+        odleglosc_pozioma_s = st.number_input("Odstęp poziomy między prętami [mm] (clear)", value=float(d("s_odst_poziomy", 5.0)), key="s_odst_poziomy")
     with colw5:
-        odleglosc_pionowa_s = st.number_input(
-            "Odstęp pionowy między warstwami [mm] (clear)",
-            value=5.0,
-            key="s_odst_pionowy",
-        )
+        odleglosc_pionowa_s = st.number_input("Odstęp pionowy między warstwami [mm] (clear)", value=float(d("s_odst_pionowy", 5.0)), key="s_odst_pionowy")
 
-    n_wlasne_s = int(st.number_input("Liczba prętów w 1 warstwie [szt.]", min_value=0, value=2, key="s_n_wlasne"))
-    warstwy_wlasne_s = int(st.number_input("Liczba warstw [szt.]", min_value=0, value=1, key="s_warstwy_wlasne"))
+    n_wlasne_s = int(st.number_input("Liczba prętów w 1 warstwie [szt.]", min_value=0, value=int(d("s_n_wlasne", 2)), step=1, key="s_n_wlasne"))
+    warstwy_wlasne_s = int(st.number_input("Liczba warstw [szt.]", min_value=0, value=int(d("s_warstwy_wlasne", 1)), step=1, key="s_warstwy_wlasne"))
 
     szer_dostepna_s = b_rect_mm - 2 * otulina_boczna_s
     wysokosc_dostepna_s = h_rect_mm - otulina_gorna_s - otulina_dolna_s
@@ -1131,7 +1097,6 @@ with col_ws_left:
     for v in violations_s:
         st.error(v)
 
-    # As + obwód
     A_pręt_s = math.pi * (phi_top_mm / 2.0) ** 2 / 100.0  # cm²
     As_top = A_pręt_s * n_wlasne_s * warstwy_wlasne_s
     O_top = math.pi * phi_top_mm * n_wlasne_s * warstwy_wlasne_s
@@ -1170,22 +1135,18 @@ with col_ws_right:
 
     if fits_top:
         fi = phi_top_mm
-
         szer_dostepna_vis = max(0.0, b_rect_mm - 2 * otulina_boczna_s)
 
-        # poziom: rozkład po szerokości
         if n_wlasne_s == 1:
             x_poz_s = [b_rect_mm / 2.0]
         else:
             x0_s = otulina_boczna_s + fi / 2.0
             x_poz_s = [x0_s + i * (szer_dostepna_vis - fi) / (n_wlasne_s - 1) for i in range(n_wlasne_s)]
 
-        # pion: warstwy liczone OD GÓRY w dół
         y_top_center = h_rect_mm - otulina_gorna_s - fi / 2.0
         krok = fi + odleglosc_pionowa_s
         y_poz_s = [y_top_center - j * krok for j in range(warstwy_wlasne_s)]
 
-        # filtr: nie schodzimy poniżej otuliny dolnej
         min_center = otulina_dolna_s + fi / 2.0
         y_poz_s = [y for y in y_poz_s if y >= min_center]
 
@@ -1212,7 +1173,7 @@ with col_ws_right:
     st.plotly_chart(fig_top, use_container_width=True)
 
 # ============================================================
-# 4) PODSUMOWANIE ZBROJENIA (dół / góra / łącznie)
+# 4) PODSUMOWANIE ZBROJENIA
 # ============================================================
 st.subheader("Podsumowanie zbrojenia")
 
@@ -2281,13 +2242,13 @@ with st.form(key="save_beam_form", clear_on_submit=False):
     with colR:
         beam_name_in = st.text_input(
             "Nazwa belki",
-            value=str(st.session_state.get("__d__beam_name_to_save", "")),
+            value=str(st.session_state.get("beam_name_to_save", "")),
             key="beam_name_to_save",
         )
 
     confirm_overwrite_beam = st.checkbox(
         "Nadpisz istniejącą belkę o tej nazwie, jeśli istnieje",
-        value=bool(st.session_state.get("__d__chk_overwrite_beam", False)),
+        value=bool(st.session_state.get("chk_overwrite_beam", False)),
         key="chk_overwrite_beam",
     )
 

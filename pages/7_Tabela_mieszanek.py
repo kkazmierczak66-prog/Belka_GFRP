@@ -398,77 +398,140 @@ def stable_json_test(df: pd.DataFrame) -> str:
     )
 
 def save_executions_and_tests_to_sheets():
-    """Zapisuje wszystkie wykonania i testy z session_state do Google Sheets."""
-    # --- wykonania ---
+    """MERGE save: nie usuwa danych innych receptur / wykonań niezaładowanych w sesji."""
+
+    # =========================
+    # 1) WYKONANIA: merge po (recipe_name, timestamp)
+    # =========================
     exec_rows = []
+    touched_exec_keys = set()  # "recipe||ts"
+
     for key, value in st.session_state.items():
         if not (isinstance(key, str) and key.startswith("exec__") and key.endswith("__df")):
             continue
-        ns_body = key[len("exec__"):-len("__df")]
+
+        ns_body = key[len("exec__") : -len("__df")]
         try:
             rname, ts_raw = ns_body.rsplit("__", 1)
         except ValueError:
             continue
+
+        touched_exec_keys.add(f"{str(rname)}||{str(ts_raw)}")
+
         df_exec = ensure_exec_ids(value)
         for _, r in df_exec.iterrows():
-            exec_rows.append({
-                "recipe_name": rname,
-                "timestamp": ts_raw,
-                "Nr wyk.": r.get("Nr wyk.", ""),
-                "Data wyk.": r.get("Data wyk.", ""),
-                "Wykonawca/y": r.get("Wykonawca/y", ""),
-                "Uwagi": r.get("Uwagi", ""),
-            })
+            exec_rows.append(
+                {
+                    "recipe_name": str(rname),
+                    "timestamp": str(ts_raw),
+                    "Nr wyk.": r.get("Nr wyk.", ""),
+                    "Data wyk.": r.get("Data wyk.", ""),
+                    "Wykonawca/y": r.get("Wykonawca/y", ""),
+                    "Uwagi": r.get("Uwagi", ""),
+                }
+            )
+
+    # wczytaj stare wykonania
+    old_exec = read_executions_sheet(SPREADSHEET_ID, SHEET_EXECUTIONS)
+    if old_exec is None or old_exec.empty:
+        old_exec = pd.DataFrame(columns=EXEC_HEADER)
+    else:
+        for c in EXEC_HEADER:
+            if c not in old_exec.columns:
+                old_exec[c] = ""
+
+    if touched_exec_keys:
+        old_key = old_exec["recipe_name"].astype(str) + "||" + old_exec["timestamp"].astype(str)
+        keep_old_exec = old_exec[~old_key.isin(touched_exec_keys)].copy()
+    else:
+        keep_old_exec = old_exec.copy()
+
+    new_exec_df = pd.DataFrame(exec_rows, columns=EXEC_HEADER) if exec_rows else pd.DataFrame(columns=EXEC_HEADER)
+    merged_exec = pd.concat([keep_old_exec, new_exec_df], ignore_index=True)
 
     ws_exec = _open_or_create_ws(SPREADSHEET_ID, SHEET_EXECUTIONS, EXEC_HEADER)
     ws_exec.clear()
-    exec_values = [EXEC_HEADER]
-    if exec_rows:
-        exec_values += [[gs_cell(row.get(col, "")) for col in EXEC_HEADER] for row in exec_rows]
+    exec_values = [EXEC_HEADER] + [
+        [gs_cell(row.get(col, "")) for col in EXEC_HEADER] for row in merged_exec.to_dict(orient="records")
+    ]
     ws_exec.update("A1", exec_values)
 
-    # --- testy ---
+    # =========================
+    # 2) TESTY: merge po (recipe_name, timestamp, Nr wyk.)
+    # =========================
     test_rows = []
+    touched_test_keys = set()  # "recipe||ts||nr_wyk"
+
     for key, value in st.session_state.items():
         if not (isinstance(key, str) and key.startswith("tests__") and key.endswith("__df")):
             continue
-        ns_body = key[len("tests__"):-len("__df")]
+
+        ns_body = key[len("tests__") : -len("__df")]
         try:
             rname, ts_raw, nr_wyk_str = ns_body.rsplit("__", 2)
         except ValueError:
             continue
+
         try:
             nr_wyk_int = int(nr_wyk_str)
         except Exception:
             nr_wyk_int = None
 
+        touched_test_keys.add(f"{str(rname)}||{str(ts_raw)}||{str(nr_wyk_int)}")
+
         df_tests = ensure_test_ids(value)
 
-        # zapisujemy również pola liczone (wiek, gęstość, wynik),
-        # bo o to prosisz ("ma się zapisywać do google sheets")
         for _, r in df_tests.iterrows():
-            test_rows.append({
-                "recipe_name": rname,
-                "timestamp": ts_raw,
-                "Nr wyk.": nr_wyk_int,
-                "Nr testu": r.get("Nr testu", ""),
-                "Data testu": r.get("Data testu", ""),
-                "Wiek próbki [dni]": r.get("Wiek próbki [dni]", ""),
-                "Rodzaj": r.get("Rodzaj", ""),
-                "Masa próbki [g]": r.get("Masa próbki [g]", ""),
-                "Gęstość [kg/m3]": r.get("Gęstość [kg/m3]", ""),
-                "Siła niszcząca [kN]": r.get("Siła niszcząca [kN]", ""),
-                "Wynik [MPa]": r.get("Wynik [MPa]", ""),
-                "Wykonawca/y": r.get("Wykonawca/y", ""),
-                "Opis zniszczenia / Uwagi": r.get("Opis zniszczenia / Uwagi", ""),
-            })
+            test_rows.append(
+                {
+                    "recipe_name": str(rname),
+                    "timestamp": str(ts_raw),
+                    "Nr wyk.": nr_wyk_int,
+                    "Nr testu": r.get("Nr testu", ""),
+                    "Data testu": r.get("Data testu", ""),
+                    "Wiek próbki [dni]": r.get("Wiek próbki [dni]", ""),
+                    "Rodzaj": r.get("Rodzaj", ""),
+                    "Masa próbki [g]": r.get("Masa próbki [g]", ""),
+                    "Gęstość [kg/m3]": r.get("Gęstość [kg/m3]", ""),
+                    "Siła niszcząca [kN]": r.get("Siła niszcząca [kN]", ""),
+                    "Wynik [MPa]": r.get("Wynik [MPa]", ""),
+                    "Wykonawca/y": r.get("Wykonawca/y", ""),
+                    "Opis zniszczenia / Uwagi": r.get("Opis zniszczenia / Uwagi", ""),
+                }
+            )
+
+    old_tests = read_tests_sheet(SPREADSHEET_ID, SHEET_TESTS)
+    if old_tests is None or old_tests.empty:
+        old_tests = pd.DataFrame(columns=TEST_HEADER)
+    else:
+        # ujednolicenie nazw kolumn (tak jak w read_tests_sheet)
+        old_tests.columns = [str(c).strip().replace("m³", "m3") for c in old_tests.columns]
+        for c in TEST_HEADER:
+            if c not in old_tests.columns:
+                old_tests[c] = ""
+
+    if touched_test_keys:
+        old_key = (
+            old_tests["recipe_name"].astype(str)
+            + "||"
+            + old_tests["timestamp"].astype(str)
+            + "||"
+            + old_tests["Nr wyk."].astype(str)
+        )
+        keep_old_tests = old_tests[~old_key.isin(touched_test_keys)].copy()
+    else:
+        keep_old_tests = old_tests.copy()
+
+    new_tests_df = pd.DataFrame(test_rows, columns=TEST_HEADER) if test_rows else pd.DataFrame(columns=TEST_HEADER)
+    merged_tests = pd.concat([keep_old_tests, new_tests_df], ignore_index=True)
 
     ws_test = _open_or_create_ws(SPREADSHEET_ID, SHEET_TESTS, TEST_HEADER)
     ws_test.clear()
-    test_values = [TEST_HEADER]
-    if test_rows:
-        test_values += [[gs_cell(row.get(col, "")) for col in TEST_HEADER] for row in test_rows]
+    test_values = [TEST_HEADER] + [
+        [gs_cell(row.get(col, "")) for col in TEST_HEADER] for row in merged_tests.to_dict(orient="records")
+    ]
     ws_test.update("A1", test_values)
+
 
 def load_exec_state_from_sheet(rname: str, ts_raw: str, exec_ns: str):
     """Lazy load wykonań dla (recipe_name, timestamp)."""
@@ -610,9 +673,11 @@ with btn_save_col:
     if st.button("💾 Zapisz wszystko", use_container_width=True):
         try:
             save_executions_and_tests_to_sheets()
+            st.cache_data.clear()  # <-- TO DOPISZ (żeby odświeżyć cache odczytu)
             st.toast("Zapisano wykonania i testy do Google Sheets ✔️", icon="✅")
         except Exception as e:
             st.error(f"Nie udało się zapisać danych wykonania/testów: {e}")
+
 
 # ---------- Główne dane z session_state ----------
 df_mat = st.session_state["df_mat"]
